@@ -1,0 +1,120 @@
+# ==============================================================================
+# Environment & Secrets (Crucial: Never commit credentials)
+# ==============================================================================
+.env
+.env.*
+!.env.example
+*.env
+
+# ==============================================================================
+# Python & Bytecode
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==============================================================================
+# Virtual Environments
+# ==============================================================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==============================================================================
+# Testing, Coverage & Linters
+# ==============================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+
+# ==============================================================================
+# ML Artifacts, Models & Serialized Binaries
+# ==============================================================================
+backend/artifacts/*
+!backend/artifacts/.gitkeep
+*.joblib
+*.pkl
+*.pickle
+*.h5
+*.pt
+*.pth
+*.onnx
+
+# ==============================================================================
+# Data & Predictions (Runtime generated / uploaded files)
+# Keep only demo sample datasets and gitkeep
+# ==============================================================================
+data/*
+!data/churn.csv
+!data/churn_unlabeled.csv
+!data/housing.csv
+!data/housing_test_unlabeled.csv
+!data/wine.csv
+!data/.gitkeep
+*.csv.zip
+
+# ==============================================================================
+# Logs
+# ==============================================================================
+*.log
+backend.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ==============================================================================
+# Frontend & Node.js
+# ==============================================================================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+.npm
+*.local
+
+# ==============================================================================
+# IDEs, Editors & OS Files
+# ==============================================================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
