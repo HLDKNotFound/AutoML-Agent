@@ -63,9 +63,6 @@ All backend ML execution must run inside the predefined Conda environment: `ml-e
 ### 1. Activate Environment & Install Dependencies
 
 ```bash
-# Activate the predefined conda environment
-conda activate ml-env
-
 # Install backend dependencies
 pip install -r requirements.txt
 
@@ -106,7 +103,6 @@ Start the frontend in another terminal:
 
 **Backend (FastAPI on Port 8000):**
 ```bash
-conda activate ml-env
 export PYTHONPATH=.
 python -m backend.app.main
 ```

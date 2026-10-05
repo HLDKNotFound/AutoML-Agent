@@ -10,6 +10,7 @@ import ValidationComparisonSection from './components/ValidationComparisonSectio
 import FinalTestEvaluationSection from './components/FinalTestEvaluationSection';
 import PredictionSection from './components/PredictionSection';
 import ApiKeyModal from './components/ApiKeyModal';
+import LiveStageBanner from './components/LiveStageBanner';
 
 const INITIAL_STEPS = [
   { id: 1, name: 'Upload Dataset', status: 'pending' },
@@ -39,6 +40,11 @@ export default function App() {
   
   const [workflowStatus, setWorkflowStatus] = useState('pending'); // pending, running, completed, failed
   const [events, setEvents] = useState([]);
+  const [startTime, setStartTime] = useState(null);
+  const [activeRunningStepId, setActiveRunningStepId] = useState(null);
+  const [activeRunningStepName, setActiveRunningStepName] = useState('');
+  const [activeRunningMessage, setActiveRunningMessage] = useState('');
+  const [errorDetails, setErrorDetails] = useState(null);
   
   // Pipeline Data from Backend
   const [profile, setProfile] = useState(null);
@@ -181,7 +187,15 @@ export default function App() {
       if (data.test_results) setTestResults(data.test_results);
       if (data.plots) setPlots(data.plots);
       if (data.agent_decisions) setAgentDecisions(data.agent_decisions);
-      if (data.status) setWorkflowStatus(data.status);
+      
+      if (data.error || data.status === 'failed') {
+        setWorkflowStatus('failed');
+        setErrorDetails(data.error || 'Pipeline execution failed.');
+        setActiveRunningStepName('Execution Failed');
+        setActiveRunningMessage(data.error || 'Execution encountered an error.');
+      } else if (data.status) {
+        setWorkflowStatus(data.status);
+      }
     } catch (err) {
       console.error('Failed to sync session state:', err);
     }
@@ -190,8 +204,14 @@ export default function App() {
   const handleStartPipeline = async () => {
     if (!sessionId || !targetColumn) return;
     setIsStarting(true);
+    setErrorDetails(null);
     setWorkflowStatus('running');
+    setStartTime(Date.now());
+    setActiveRunningStepId(2);
+    setActiveRunningStepName('Dataset Verification');
+    setActiveRunningMessage('Verifying dataset schema and preparing training environment...');
     updateStepStatus(2, 'completed');
+    setCurrentStep(9); // Navigate user to live hyperparameter tuning & log stream
 
     try {
       const res = await fetch('/api/start-pipeline', {
@@ -223,20 +243,37 @@ export default function App() {
           if (ev.step_id && ev.step_id > 0) {
             updateStepStatus(ev.step_id, ev.status);
             if (ev.status === 'running') {
-              setCurrentStep(ev.step_id);
+              setActiveRunningStepId(ev.step_id);
+              setActiveRunningStepName(ev.step_name);
+              setActiveRunningMessage(ev.message);
             }
           }
 
           // Trigger state sync on node completion
-          fetchSessionSnapshot(sessionId);
+          if (ev.status === 'completed' || ev.step_id === 13) {
+            fetchSessionSnapshot(sessionId);
+          }
 
-          if (ev.step_id === 13 || ev.status === 'completed') {
+          // Handle failure event explicitly
+          if (ev.status === 'failed' || ev.step_id === -1) {
+            setWorkflowStatus('failed');
+            const errTxt = ev.message || 'Pipeline execution failed.';
+            setErrorDetails(errTxt);
+            setActiveRunningStepName('Execution Failed');
+            setActiveRunningMessage(errTxt);
+            fetchSessionSnapshot(sessionId);
+            es.close();
+            return;
+          }
+
+          // ONLY complete workflow on Step 13 (Pipeline Complete)!
+          if (ev.step_id === 13 || ev.step_name === 'Pipeline Complete') {
             setWorkflowStatus('completed');
             setSteps((prev) => prev.map((s) => ({ ...s, status: 'completed' })));
-            setCurrentStep(10); // Show validation/champion view
-            es.close();
-          } else if (ev.status === 'failed') {
-            setWorkflowStatus('failed');
+            setActiveRunningStepId(13);
+            setActiveRunningStepName('Pipeline Complete');
+            setActiveRunningMessage('Full automated machine learning workflow completed successfully!');
+            fetchSessionSnapshot(sessionId);
             es.close();
           }
         } catch (e) {
@@ -247,6 +284,21 @@ export default function App() {
       es.onerror = () => {
         es.close();
         fetchSessionSnapshot(sessionId);
+        // Probe backend for potential failure details
+        fetch(`/api/session/${sessionId}`)
+          .then((r) => r.json())
+          .then((d) => {
+            if (d.status === 'failed' || d.error) {
+              setWorkflowStatus('failed');
+              setErrorDetails(d.error || 'Backend reported a pipeline execution error.');
+              setActiveRunningStepName('Execution Failed');
+              setActiveRunningMessage(d.error || 'Execution encountered an error.');
+            }
+          })
+          .catch(() => {
+            setWorkflowStatus('failed');
+            setErrorDetails('Connection to backend server was lost. Please verify backend is running on port 8000.');
+          });
       };
     } catch (err) {
       alert(`Error starting pipeline: ${err.message}`);
@@ -306,6 +358,27 @@ export default function App() {
     setPlots({});
     setAgentDecisions([]);
     setPredictionResult(null);
+    setActiveRunningStepId(null);
+    setActiveRunningStepName('');
+    setActiveRunningMessage('');
+    setStartTime(null);
+  };
+
+  const handleSaveApiKey = async (newKey) => {
+    setGeminiApiKey(newKey);
+    try {
+      const res = await fetch('/api/configure-llm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ gemini_api_key: newKey })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(`API Key notice: ${data.detail || 'Failed to update key'}`);
+      }
+    } catch (e) {
+      console.warn('Failed to configure API key on backend:', e);
+    }
   };
 
   return (
@@ -325,9 +398,92 @@ export default function App() {
           onOpenKeyModal={() => setIsKeyModalOpen(true)}
           onResetSession={handleResetSession}
           hasKey={Boolean(geminiApiKey)}
+          workflowStatus={workflowStatus}
+          activeStepId={activeRunningStepId}
+          activeStepName={activeRunningStepName}
         />
 
         <main style={{ flex: 1, padding: '32px', overflowY: 'auto' }}>
+          {/* Active Stage Indicator Banner */}
+          <LiveStageBanner
+            workflowStatus={workflowStatus}
+            activeStepId={activeRunningStepId}
+            activeStepName={activeRunningStepName}
+            activeMessage={activeRunningMessage}
+            steps={steps}
+            startTime={startTime}
+            onViewLogs={() => setCurrentStep(9)}
+            onNavigateToStage={(sId) => setCurrentStep(sId)}
+          />
+
+          {/* Prominent Error Notification Card if workflow encountered an error */}
+          {errorDetails && (
+            <div
+              style={{
+                marginBottom: '24px',
+                padding: '16px 20px',
+                borderRadius: '12px',
+                backgroundColor: 'rgba(239, 68, 68, 0.12)',
+                border: '1px solid rgba(239, 68, 68, 0.4)',
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'space-between',
+                gap: '16px',
+                boxShadow: '0 8px 24px rgba(239, 68, 68, 0.2)'
+              }}
+            >
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '1rem' }}>🚨</span>
+                  <span style={{ fontWeight: 700, fontSize: '0.95rem', color: '#f87171' }}>
+                    Pipeline Execution Error
+                  </span>
+                </div>
+                <div style={{
+                  fontSize: '0.84rem',
+                  color: '#fca5a5',
+                  fontFamily: 'monospace',
+                  lineHeight: '1.4',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  backgroundColor: 'rgba(0, 0, 0, 0.3)',
+                  padding: '8px 12px',
+                  borderRadius: '6px',
+                  marginTop: '4px'
+                }}>
+                  {errorDetails}
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                <button
+                  onClick={() => setErrorDetails(null)}
+                  className="btn btn-secondary"
+                  style={{ fontSize: '0.78rem', padding: '6px 12px' }}
+                >
+                  Dismiss
+                </button>
+                <button
+                  onClick={() => {
+                    setErrorDetails(null);
+                    setWorkflowStatus('pending');
+                    setCurrentStep(2);
+                  }}
+                  className="btn btn-primary"
+                  style={{
+                    fontSize: '0.78rem',
+                    padding: '6px 14px',
+                    backgroundColor: '#ef4444',
+                    border: 'none',
+                    color: '#fff'
+                  }}
+                >
+                  Reconfigure
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Step 1: Upload or Sample selection */}
           {currentStep === 1 && (
             <UploadSection
@@ -419,7 +575,7 @@ export default function App() {
       <ApiKeyModal
         isOpen={isKeyModalOpen}
         onClose={() => setIsKeyModalOpen(false)}
-        onSaveKey={setGeminiApiKey}
+        onSaveKey={handleSaveApiKey}
         currentKey={geminiApiKey}
       />
     </div>

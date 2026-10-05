@@ -50,6 +50,7 @@ def run_coarse_search(
     coarse_space = search_plan.coarse_space
     trials_history = []
     best_score = -float("inf")
+    best_metric_val = 0.0
     best_params = {}
     best_pipeline = None
 
@@ -58,7 +59,7 @@ def run_coarse_search(
     study = optuna.create_study(direction="maximize", sampler=sampler)
 
     def objective(trial: optuna.Trial):
-        nonlocal best_score, best_params, best_pipeline
+        nonlocal best_score, best_metric_val, best_params, best_pipeline
         params = {}
         for param_name, spec in coarse_space.items():
             p_type = spec.get("type")
@@ -81,12 +82,15 @@ def run_coarse_search(
             strategy=preprocessing_strategy
         )
 
-        t0 = time.perf_counter()
-        pipeline.fit(X_train, y_train)
-        fit_time = time.perf_counter() - t0
+        try:
+            t0 = time.perf_counter()
+            pipeline.fit(X_train, y_train)
+            fit_time = time.perf_counter() - t0
 
-        eval_res = evaluate_pipeline(pipeline, X_val, y_val, problem_type, train_time_sec=fit_time)
-        score = _score_from_metrics(eval_res["metrics"], primary_metric, problem_type)
+            eval_res = evaluate_pipeline(pipeline, X_val, y_val, problem_type, train_time_sec=fit_time)
+            score = _score_from_metrics(eval_res["metrics"], primary_metric, problem_type)
+        except Exception as e:
+            return -999999.0
 
         trial_data = {
             "trial_number": trial.number,
@@ -100,6 +104,7 @@ def run_coarse_search(
 
         if score > best_score:
             best_score = score
+            best_metric_val = eval_res["metrics"].get(primary_metric, 0.0)
             best_params = dict(params)
             best_pipeline = pipeline
 
@@ -109,12 +114,13 @@ def run_coarse_search(
                 "trial": trial.number + 1,
                 "total": n_trials,
                 "current_score": eval_res["metrics"].get(primary_metric, 0.0),
-                "best_score": best_pipeline is not None and eval_res["metrics"].get(primary_metric, 0.0)
+                "best_score": best_metric_val
             })
 
         return score
 
-    study.optimize(objective, n_trials=n_trials, n_jobs=1)
+    timeout_sec = min(40.0, float(getattr(config, "max_training_time_sec", 300)))
+    study.optimize(objective, n_trials=n_trials, n_jobs=1, timeout=timeout_sec)
 
     return {
         "best_params": best_params,
@@ -147,6 +153,7 @@ def run_fine_search(
     fine_space = search_plan.fine_space
     trials_history = []
     best_score = -float("inf")
+    best_metric_val = 0.0
     best_params = dict(coarse_best_params)
     best_pipeline = None
 
@@ -175,7 +182,7 @@ def run_fine_search(
             study.enqueue_trial(seeded)
 
     def objective(trial: optuna.Trial):
-        nonlocal best_score, best_params, best_pipeline
+        nonlocal best_score, best_metric_val, best_params, best_pipeline
         params = dict(coarse_best_params)  # start from best coarse values
         
         for param_name, spec in fine_space.items():
@@ -198,12 +205,15 @@ def run_fine_search(
             strategy=preprocessing_strategy
         )
 
-        t0 = time.perf_counter()
-        pipeline.fit(X_train, y_train)
-        fit_time = time.perf_counter() - t0
+        try:
+            t0 = time.perf_counter()
+            pipeline.fit(X_train, y_train)
+            fit_time = time.perf_counter() - t0
 
-        eval_res = evaluate_pipeline(pipeline, X_val, y_val, problem_type, train_time_sec=fit_time)
-        score = _score_from_metrics(eval_res["metrics"], primary_metric, problem_type)
+            eval_res = evaluate_pipeline(pipeline, X_val, y_val, problem_type, train_time_sec=fit_time)
+            score = _score_from_metrics(eval_res["metrics"], primary_metric, problem_type)
+        except Exception as e:
+            return -999999.0
 
         trial_data = {
             "trial_number": trial.number,
@@ -217,6 +227,7 @@ def run_fine_search(
 
         if score > best_score:
             best_score = score
+            best_metric_val = eval_res["metrics"].get(primary_metric, 0.0)
             best_params = dict(params)
             best_pipeline = pipeline
 
@@ -226,12 +237,13 @@ def run_fine_search(
                 "trial": trial.number + 1,
                 "total": n_trials,
                 "current_score": eval_res["metrics"].get(primary_metric, 0.0),
-                "best_score": best_pipeline is not None and eval_res["metrics"].get(primary_metric, 0.0)
+                "best_score": best_metric_val
             })
 
         return score
 
-    study.optimize(objective, n_trials=n_trials, n_jobs=1)
+    timeout_sec = min(40.0, float(getattr(config, "max_training_time_sec", 300)))
+    study.optimize(objective, n_trials=n_trials, n_jobs=1, timeout=timeout_sec)
 
     return {
         "best_params": best_params,

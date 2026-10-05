@@ -3,6 +3,7 @@ FastAPI Main Application Entry Point.
 Initializes middleware, CORS, routes, and startup checks.
 """
 
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.app.api.endpoints import router
@@ -14,10 +15,13 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for React frontend
+# Enable CORS for React frontend (configurable via CORS_ORIGINS)
+cors_env = os.getenv("CORS_ORIGINS", "*").strip()
+allowed_origins = [o.strip() for o in cors_env.split(",") if o.strip()] if cors_env != "*" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

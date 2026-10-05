@@ -25,12 +25,15 @@ TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _get_api_key() -> str:
-    return (
+    key = (
         os.getenv("GEMINI_API_KEY") or
         os.getenv("GOOGLE_API_KEY") or
-        os.getenv("GOOGLE_API") or
         ""
     ).strip()
+    # Reject OAuth access tokens that cause 401 ACCESS_TOKEN_TYPE_UNSUPPORTED
+    if key.startswith("AQ.") or key.startswith("ya29."):
+        return ""
+    return key
 
 
 class SystemConfig(BaseModel):

@@ -118,3 +118,5 @@ Thumbs.db
 *.ntvs*
 *.njsproj
 *.sln
+test_demo/
+test_house_pricing/

@@ -32,21 +32,35 @@ def get_search_plan_for_model(model_name: str, problem_type: str) -> Hyperparame
         }
         notes = "Tree ensemble: coarse broad depth scan followed by fine tuning of tree complexity."
 
-    # 2. Gradient Boosting (GBDT)
-    elif "gradientboosting" in name or "histgradientboosting" in name or "lightgbm" in name or "xgboost" in name:
+    # 2. Hist Gradient Boosting / LightGBM / XGBoost (Histogram-accelerated)
+    elif "histgradientboosting" in name or "lightgbm" in name or "xgboost" in name:
         coarse_space = {
             "n_estimators": {"type": "int", "low": 30, "high": 180, "step": 30},
             "learning_rate": {"type": "log_float", "low": 1e-3, "high": 0.3},
-            "max_depth": {"type": "int", "low": 2, "high": 10},
-            "subsample": {"type": "float", "low": 0.6, "high": 1.0}
+            "max_depth": {"type": "int", "low": 3, "high": 10}
         }
         fine_space = {
             "n_estimators": {"type": "int", "low": 50, "high": 200, "step": 10},
             "learning_rate": {"type": "log_float", "low": 5e-3, "high": 0.2},
-            "max_depth": {"type": "int", "low": 3, "high": 8},
+            "max_depth": {"type": "int", "low": 3, "high": 8}
+        }
+        notes = "Histogram GBDT: fast binning allows deep tree exploration."
+
+    # 3. Standard Gradient Boosting (Sequential exact greedy splits)
+    elif "gradientboosting" in name:
+        coarse_space = {
+            "n_estimators": {"type": "int", "low": 20, "high": 80, "step": 20},
+            "learning_rate": {"type": "log_float", "low": 0.01, "high": 0.3},
+            "max_depth": {"type": "int", "low": 2, "high": 5},
             "subsample": {"type": "float", "low": 0.7, "high": 1.0}
         }
-        notes = "GBDT strategy: learning_rate and n_estimators tuned jointly with log-uniform scale and tree depth."
+        fine_space = {
+            "n_estimators": {"type": "int", "low": 20, "high": 80, "step": 10},
+            "learning_rate": {"type": "log_float", "low": 0.02, "high": 0.2},
+            "max_depth": {"type": "int", "low": 2, "high": 4},
+            "subsample": {"type": "float", "low": 0.8, "high": 1.0}
+        }
+        notes = "Standard GBDT: shallow trees (depth 2-5) with sqrt subsampling for fast convergence."
 
     # 3. Linear / Logistic / Ridge
     elif "logistic" in name or "ridge" in name:
@@ -70,7 +84,21 @@ def get_search_plan_for_model(model_name: str, problem_type: str) -> Hyperparame
         }
         notes = "Kernel SVM: margin softness C optimized over log-uniform space."
 
-    # 5. K-Nearest Neighbors
+    # 5. Extra Trees
+    elif "extratrees" in name:
+        coarse_space = {
+            "n_estimators": {"type": "int", "low": 20, "high": 180, "step": 20},
+            "max_depth": {"type": "int", "low": 3, "high": 20},
+            "min_samples_split": {"type": "int", "low": 2, "high": 15}
+        }
+        fine_space = {
+            "n_estimators": {"type": "int", "low": 40, "high": 200, "step": 10},
+            "max_depth": {"type": "int", "low": 4, "high": 16},
+            "min_samples_split": {"type": "int", "low": 2, "high": 8}
+        }
+        notes = "ExtraTrees randomized ensemble: tree complexity and split depth tuning."
+
+    # 6. K-Nearest Neighbors
     elif "kneighbors" in name:
         coarse_space = {
             "n_neighbors": {"type": "int", "low": 2, "high": 30},

@@ -37,7 +37,8 @@ def run_ml_strategy_agent(
     1. Determine problem_type: 'binary_classification', 'multiclass_classification', or 'regression'.
     2. Select primary_metric: 'f1_macro', 'roc_auc', 'accuracy', 'rmse', 'r2', or 'mae'.
     3. Select EXACTLY 5 candidate models from AT LEAST 3 distinct model families:
-       Valid families: 'linear', 'tree_ensemble', 'gradient_boosting', 'support_vector', 'neighbors', 'neural_network'.
+       Valid families: 'linear', 'tree_ensemble', 'gradient_boosting', 'support_vector', 'neighbors'.
+       IMPORTANT: For datasets with more than 1500 samples, NEVER select 'SVC' or 'SVR' (kernel SVM is O(N^3) and too slow). Instead use fast scalable models: 'HistGradientBoostingClassifier', 'ExtraTreesClassifier', 'RandomForestClassifier', 'GradientBoostingClassifier', 'LogisticRegression'.
     4. For EACH model, define an independent model-specific preprocessing_strategy:
        - Tree models: no scaling (numeric_scaler=null), median imputer, ordinal/one_hot encoder.
        - Linear/SVM/KNN/MLP: robust/standard scaling, one_hot encoding, median imputer.
@@ -133,19 +134,38 @@ def run_ml_strategy_agent(
                 reason="Interpretable linear baseline with L2 regularization and calibrated probabilities.",
                 preprocessing_strategy=linear_preprocessing
             ),
-            ModelCandidate(
-                model_name="SVC",
-                model_family="support_vector",
-                reason="Kernelized decision boundary effective in complex non-linear feature spaces.",
-                preprocessing_strategy=kernel_preprocessing
-            ),
-            ModelCandidate(
-                model_name="KNeighborsClassifier",
-                model_family="neighbors",
-                reason="Instance-based non-parametric classifier capturing localized data manifolds.",
-                preprocessing_strategy=neighbors_preprocessing
-            )
         ]
+        if total_rows > 1500:
+            # Datasets with >1500 samples: replace slow O(N^3) SVC and instance KNN with high-speed scalable tree models
+            candidate_models.extend([
+                ModelCandidate(
+                    model_name="HistGradientBoostingClassifier",
+                    model_family="gradient_boosting",
+                    reason="High-efficiency histogram-based gradient boosting scaling gracefully to large tabular datasets.",
+                    preprocessing_strategy=boosting_preprocessing
+                ),
+                ModelCandidate(
+                    model_name="ExtraTreesClassifier",
+                    model_family="tree_ensemble",
+                    reason="Extremely randomized trees providing variance reduction and near-instant training on tabular data.",
+                    preprocessing_strategy=tree_preprocessing
+                )
+            ])
+        else:
+            candidate_models.extend([
+                ModelCandidate(
+                    model_name="SVC",
+                    model_family="support_vector",
+                    reason="Kernelized decision boundary effective in complex non-linear feature spaces.",
+                    preprocessing_strategy=kernel_preprocessing
+                ),
+                ModelCandidate(
+                    model_name="KNeighborsClassifier",
+                    model_family="neighbors",
+                    reason="Instance-based non-parametric classifier capturing localized data manifolds.",
+                    preprocessing_strategy=neighbors_preprocessing
+                )
+            ])
     else:
         # Regression models
         candidate_models = [
@@ -167,19 +187,37 @@ def run_ml_strategy_agent(
                 reason="L2-regularized linear regression preventing coefficient explosion with multicollinearity.",
                 preprocessing_strategy=linear_preprocessing
             ),
-            ModelCandidate(
-                model_name="SVR",
-                model_family="support_vector",
-                reason="Epsilon-insensitive loss function effective in non-linear regression with margin boundaries.",
-                preprocessing_strategy=kernel_preprocessing
-            ),
-            ModelCandidate(
-                model_name="KNeighborsRegressor",
-                model_family="neighbors",
-                reason="Distance-weighted k-nearest neighbors regression for localized non-linear surfaces.",
-                preprocessing_strategy=neighbors_preprocessing
-            )
         ]
+        if total_rows > 1500:
+            candidate_models.extend([
+                ModelCandidate(
+                    model_name="HistGradientBoostingRegressor",
+                    model_family="gradient_boosting",
+                    reason="Fast histogram-based gradient boosting regression scaling to large tabular datasets.",
+                    preprocessing_strategy=boosting_preprocessing
+                ),
+                ModelCandidate(
+                    model_name="ExtraTreesRegressor",
+                    model_family="tree_ensemble",
+                    reason="Extremely randomized regression trees providing rapid training and high generalization.",
+                    preprocessing_strategy=tree_preprocessing
+                )
+            ])
+        else:
+            candidate_models.extend([
+                ModelCandidate(
+                    model_name="SVR",
+                    model_family="support_vector",
+                    reason="Epsilon-insensitive loss function effective in non-linear regression with margin boundaries.",
+                    preprocessing_strategy=kernel_preprocessing
+                ),
+                ModelCandidate(
+                    model_name="KNeighborsRegressor",
+                    model_family="neighbors",
+                    reason="Distance-weighted k-nearest neighbors regression for localized non-linear surfaces.",
+                    preprocessing_strategy=neighbors_preprocessing
+                )
+            ])
 
     reasoning = (
         f"Selected 5 distinct models across 5 model families ('tree_ensemble', 'gradient_boosting', "

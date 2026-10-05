@@ -53,10 +53,35 @@ export default function ApiKeyModal({ isOpen, onClose, onSaveKey, currentKey }) 
           If not provided, the pipeline executes seamlessly using the built-in deterministic Senior Data Scientist heuristics engine.
         </p>
 
+        {keyInput.trim().startsWith('AQ.') && (
+          <div style={{
+            padding: '10px 14px',
+            backgroundColor: 'rgba(244, 63, 94, 0.12)',
+            border: '1px solid rgba(244, 63, 94, 0.35)',
+            borderRadius: 'var(--radius-md)',
+            marginBottom: '16px',
+            fontSize: '0.78rem',
+            color: '#fda4af',
+            lineHeight: '1.4'
+          }}>
+            <strong>⚠️ Invalid Key Format:</strong> The entered key appears to be an OAuth access token (starts with <code>AQ.</code>). Google AI Studio Gemini API keys start with <code>AIzaSy...</code>. Using an OAuth token here will cause a 401 UNAUTHENTICATED error.
+          </div>
+        )}
+
         <div style={{ marginBottom: '20px' }}>
-          <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '8px' }}>
-            API Key
-          </label>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+            <label style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>
+              Gemini API Key (Google AI Studio)
+            </label>
+            <a
+              href="https://aistudio.google.com/app/apikey"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ fontSize: '0.72rem', color: '#38bdf8', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '4px' }}
+            >
+              Get Free Key <ExternalLink size={11} />
+            </a>
+          </div>
           <input
             type="password"
             placeholder="AIzaSy..."
@@ -66,7 +91,7 @@ export default function ApiKeyModal({ isOpen, onClose, onSaveKey, currentKey }) 
               width: '100%',
               padding: '10px 14px',
               backgroundColor: 'var(--bg-secondary)',
-              border: '1px solid var(--border-subtle)',
+              border: keyInput.trim().startsWith('AQ.') ? '1px solid #f43f5e' : '1px solid var(--border-subtle)',
               borderRadius: 'var(--radius-md)',
               color: 'var(--text-primary)',
               fontSize: '0.88rem',
@@ -75,13 +100,33 @@ export default function ApiKeyModal({ isOpen, onClose, onSaveKey, currentKey }) 
           />
         </div>
 
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
-          <button onClick={onClose} className="btn btn-secondary">
-            Cancel
-          </button>
-          <button onClick={handleSave} className="btn btn-primary">
-            <Check size={14} /> Save Configuration
-          </button>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
+          {currentKey ? (
+            <button
+              onClick={() => {
+                setKeyInput('');
+                onSaveKey('');
+                onClose();
+              }}
+              className="btn btn-secondary"
+              style={{ color: '#fb7185', borderColor: 'rgba(251, 113, 133, 0.3)', fontSize: '0.78rem' }}
+            >
+              Clear Key (Use Offline Mode)
+            </button>
+          ) : <div />}
+
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <button onClick={onClose} className="btn btn-secondary">
+              Cancel
+            </button>
+            <button
+              onClick={handleSave}
+              className="btn btn-primary"
+              disabled={keyInput.trim().startsWith('AQ.')}
+            >
+              <Check size={14} /> Save Configuration
+            </button>
+          </div>
         </div>
       </div>
     </div>

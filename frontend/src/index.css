@@ -302,3 +302,45 @@ body {
   z-index: 1000;
   padding: 20px;
 }
+
+/* Live Stage Pulse & Glow */
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 16px rgba(56, 189, 248, 0.4);
+    border-color: rgba(56, 189, 248, 0.6);
+  }
+  50% {
+    box-shadow: 0 0 28px rgba(56, 189, 248, 0.75);
+    border-color: rgba(56, 189, 248, 0.95);
+  }
+}
+
+.stage-pulse {
+  animation: pulse-glow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes radar-pulse {
+  0% {
+    transform: scale(0.95);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.15);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(0.95);
+    opacity: 1;
+  }
+}
+
+.radar-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #38bdf8;
+  display: inline-block;
+  animation: radar-pulse 1.5s ease-in-out infinite;
+  box-shadow: 0 0 10px #38bdf8;
+}
+

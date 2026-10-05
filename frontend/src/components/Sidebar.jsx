@@ -102,10 +102,11 @@ export default function Sidebar({ steps, currentStep, onSelectStep, workflowStat
           const StepIcon = STEP_ICONS[step.id] || Circle;
           const isActive = currentStep === step.id;
 
+          const isRunning = step.status === 'running';
           let statusIcon;
           if (step.status === 'completed') {
             statusIcon = <CheckCircle2 size={15} color="#34d399" />;
-          } else if (step.status === 'running') {
+          } else if (isRunning) {
             statusIcon = <Loader2 size={15} color="#38bdf8" className="animate-spin" />;
           } else if (step.status === 'failed') {
             statusIcon = <XCircle size={15} color="#fb7185" />;
@@ -123,9 +124,18 @@ export default function Sidebar({ steps, currentStep, onSelectStep, workflowStat
                 justifyContent: 'space-between',
                 padding: '9px 12px',
                 borderRadius: 'var(--radius-md)',
-                backgroundColor: isActive ? 'rgba(56, 189, 248, 0.1)' : 'transparent',
-                border: isActive ? '1px solid var(--border-active)' : '1px solid transparent',
-                color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
+                backgroundColor: isRunning 
+                  ? 'rgba(56, 189, 248, 0.16)' 
+                  : isActive 
+                  ? 'rgba(56, 189, 248, 0.08)' 
+                  : 'transparent',
+                border: isRunning 
+                  ? '1px solid #38bdf8' 
+                  : isActive 
+                  ? '1px solid var(--border-active)' 
+                  : '1px solid transparent',
+                boxShadow: isRunning ? '0 0 12px rgba(56, 189, 248, 0.35)' : 'none',
+                color: isRunning || isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
                 cursor: 'pointer',
                 textAlign: 'left',
                 width: '100%',
@@ -134,19 +144,39 @@ export default function Sidebar({ steps, currentStep, onSelectStep, workflowStat
             >
               <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                 <div style={{
-                  color: isActive ? '#38bdf8' : 'var(--text-muted)',
+                  color: isRunning || isActive ? '#38bdf8' : 'var(--text-muted)',
                   display: 'flex',
                   alignItems: 'center'
                 }}>
                   <StepIcon size={16} />
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column' }}>
-                  <span style={{ fontSize: '0.8rem', fontWeight: isActive ? 600 : 500 }}>
+                  <span style={{ fontSize: '0.8rem', fontWeight: isRunning || isActive ? 600 : 500 }}>
                     {step.id}. {step.name}
                   </span>
+                  {isRunning && (
+                    <span style={{ fontSize: '0.68rem', color: '#38bdf8', fontWeight: 700, letterSpacing: '0.04em' }}>
+                      IN PROGRESS...
+                    </span>
+                  )}
                 </div>
               </div>
-              <div>{statusIcon}</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                {isRunning && (
+                  <span style={{
+                    fontSize: '0.65rem',
+                    padding: '1px 6px',
+                    borderRadius: '4px',
+                    backgroundColor: '#38bdf8',
+                    color: '#040711',
+                    fontWeight: 800,
+                    letterSpacing: '0.04em'
+                  }}>
+                    ACTIVE
+                  </span>
+                )}
+                {statusIcon}
+              </div>
             </button>
           );
         })}

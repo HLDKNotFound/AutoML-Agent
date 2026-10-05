@@ -280,3 +280,112 @@ def test_full_langgraph_workflow_end_to_end(synthetic_classification_df):
     zip_file = ARTIFACTS_DIR / f"{session_id}_model_artifact.zip"
     if zip_file.exists():
         zip_file.unlink()
+
+
+def test_data_quality_agent_edge_cases():
+    """Verifies edge case handling in data quality agent heuristics and sanitization."""
+    profile = {
+        "dataset": {
+            "total_rows": 100,
+            "total_columns": 5,
+            "duplicate_rows": 10,
+            "missing_cells": 15
+        },
+        "target_stats": {
+            "type": "binary_classification",
+            "num_classes": 2,
+            "missing_count": 5
+        },
+        "numerical_stats": {
+            "outlier_col": {
+                "outliers_pct": 0.12,
+                "skewness": 2.5,
+                "missing_pct": 0.0,
+                "is_constant": False,
+                "is_id_candidate": False
+            }
+        },
+        "categorical_stats": {
+            "cat_id": {
+                "unique_categories": 100,
+                "missing_pct": 0.0,
+                "is_constant": False,
+                "high_cardinality": True
+            },
+            "high_missing_cat": {
+                "unique_categories": 3,
+                "missing_pct": 0.90,
+                "is_constant": False,
+                "high_cardinality": False
+            }
+        },
+        "high_correlation_pairs": [
+            {"feature1": "f1", "feature2": "f2", "correlation": 0.92}
+        ]
+    }
+
+    report = run_data_quality_agent(
+        profile=profile,
+        target_column="target",
+        feature_columns=["cat_id", "high_missing_cat", "outlier_col", "f1", "f2"],
+        iteration=1
+    )
+
+    assert isinstance(report, DataQualityReport)
+    # Target missing should be flagged
+    assert any(p.category == "missing_target" for p in report.problems)
+    # Cat ID should be removed
+    assert "cat_id" in report.removed_features
+    # Extreme missing categorical (> 80%) should be dropped
+    assert "high_missing_cat" in report.removed_features
+    # Duplicate rows warning
+    assert any("duplicate rows" in w.lower() for w in report.warnings)
+    # Collinearity problem
+    assert any(p.category == "collinearity" for p in report.problems)
+    # Outliers problem
+    assert any(p.category == "outliers" for p in report.problems)
+
+
+def test_dataframe_cache_and_pipeline_registry(synthetic_classification_df):
+    from backend.app.graph.workflow import get_cached_dataframe, clear_dataframe_cache, _SESSION_PIPELINES, get_session_pipelines
+    _, file_path = synthetic_classification_df
+    clear_dataframe_cache()
+
+    df1 = get_cached_dataframe(file_path)
+    df2 = get_cached_dataframe(file_path)
+    assert df1 is df2, "Cached DataFrame should return the exact same instance in memory"
+
+    clear_dataframe_cache(file_path)
+    df3 = get_cached_dataframe(file_path)
+    assert len(df3) == 120
+
+    _SESSION_PIPELINES["sess_test_123"] = {"mock_model": object()}
+    assert "mock_model" in get_session_pipelines("sess_test_123")
+    _SESSION_PIPELINES.pop("sess_test_123", None)
+
+
+def test_endpoints_improvements():
+    import asyncio
+    import time
+    from backend.app.api.endpoints import configure_llm, LLMConfigRequest, cleanup_expired_sessions, SESSIONS
+    from fastapi import HTTPException
+
+    # Test OAuth token rejects with 400
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(configure_llm(LLMConfigRequest(gemini_api_key="AQ.Ab8RN6Igaw_EIZkPHL9k16OGydetx4r6mg3tyuKDLNVeZQxnaQV")))
+    assert exc_info.value.status_code == 400
+
+    # Test empty API key clears key successfully
+    res = asyncio.run(configure_llm(LLMConfigRequest(gemini_api_key="   ")))
+    assert res["status"] == "success"
+
+    # Test session cleanup
+    SESSIONS["old_sess"] = {"created_at": time.time() - 100000}
+    SESSIONS["fresh_sess"] = {"created_at": time.time()}
+    cleaned = cleanup_expired_sessions(max_age_seconds=3600)
+    assert cleaned >= 1
+    assert "old_sess" not in SESSIONS
+    assert "fresh_sess" in SESSIONS
+    SESSIONS.pop("fresh_sess", None)
+
+

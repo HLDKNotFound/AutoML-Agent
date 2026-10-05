@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, TypedDict
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, roc_curve
 from langgraph.graph import StateGraph, START, END
 
 from backend.app.core.config import config, ARTIFACTS_DIR
@@ -31,6 +32,30 @@ from backend.app.agents.report_agent import run_report_agent
 from backend.app.optimization.optimizer import optimize_candidate_model
 from backend.app.evaluation.evaluator import evaluate_pipeline
 from backend.app.services.artifact_manager import save_model_artifact
+
+# In-memory DataFrame cache and session pipeline store
+_DATAFRAME_CACHE: Dict[str, pd.DataFrame] = {}
+_SESSION_PIPELINES: Dict[str, Dict[str, Any]] = {}
+
+
+def get_cached_dataframe(dataset_path: str, reload: bool = False) -> pd.DataFrame:
+    """Retrieves or caches dataset DataFrame to prevent redundant disk I/O."""
+    if reload or dataset_path not in _DATAFRAME_CACHE:
+        _DATAFRAME_CACHE[dataset_path] = pd.read_csv(dataset_path)
+    return _DATAFRAME_CACHE[dataset_path]
+
+
+def clear_dataframe_cache(dataset_path: Optional[str] = None):
+    """Clears cached DataFrame for a dataset path or all datasets."""
+    if dataset_path:
+        _DATAFRAME_CACHE.pop(dataset_path, None)
+    else:
+        _DATAFRAME_CACHE.clear()
+
+
+def get_session_pipelines(session_id: str) -> Dict[str, Any]:
+    """Retrieves fitted model pipelines for a given session."""
+    return _SESSION_PIPELINES.get(session_id, {})
 
 
 class MLWorkflowState(TypedDict):
@@ -88,14 +113,14 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
 
     # Node 1: load_dataset
     def load_dataset(state: MLWorkflowState) -> Dict[str, Any]:
-        emit(1, "Upload Dataset", "running", "Loading dataset from CSV into memory...")
-        df = pd.read_csv(state["dataset_path"])
+        emit(2, "Dataset Verification", "running", "Loading dataset from CSV into memory...")
+        df = get_cached_dataframe(state["dataset_path"], reload=True)
         
         # Verify target exists
         target = state["target_column"]
         if target not in df.columns:
             err = f"Target column '{target}' not found in dataset."
-            emit(1, "Upload Dataset", "failed", err)
+            emit(2, "Dataset Verification", "failed", err)
             return {"errors": [err], "status": "failed"}
 
         # Validate selected features
@@ -103,7 +128,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
         if not features:
             features = [c for c in df.columns if c != target]
 
-        emit(1, "Upload Dataset", "completed", f"Dataset successfully loaded: {len(df)} rows, {len(df.columns)} columns.")
+        emit(2, "Dataset Verification", "completed", f"Dataset successfully verified: {len(df)} rows, {len(df.columns)} columns.")
         return {
             "initial_features": features,
             "selected_features": features,
@@ -112,8 +137,8 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
 
     # Node 2: profile_dataset
     def profile_dataset(state: MLWorkflowState) -> Dict[str, Any]:
-        emit(2, "Dataset Analysis", "running", "Computing comprehensive statistical profile...")
-        df = pd.read_csv(state["dataset_path"])
+        emit(3, "Dataset Analysis", "running", "Computing comprehensive statistical profile...")
+        df = get_cached_dataframe(state["dataset_path"])
         profile = compute_dataset_profile(
             df=df,
             target_column=state["target_column"],
@@ -136,7 +161,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             if corr_plot:
                 plots["correlation_matrix"] = corr_plot
 
-        emit(2, "Dataset Analysis", "completed", "Dataset profiling and visualizations generated.", {"profile": profile})
+        emit(3, "Dataset Analysis", "completed", "Dataset profiling and visualizations generated.", {"profile": profile})
         return {
             "dataframe_summary": profile,
             "plots": plots,
@@ -146,7 +171,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
     # Node 3: data_quality_agent
     def data_quality_agent_node(state: MLWorkflowState) -> Dict[str, Any]:
         iteration = state.get("data_quality_iteration", 1)
-        emit(3, "Data Quality", "running", f"LLM Data Analyst analyzing data quality (Iteration {iteration}/{config.max_data_quality_iterations})...")
+        emit(4, "Data Quality Loop", "running", f"Auditing data quality (Iteration {iteration}/{config.max_data_quality_iterations})...")
         
         report: DataQualityReport = run_data_quality_agent(
             profile=state["dataframe_summary"],
@@ -164,7 +189,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             "output_configuration": f"Valid={report.valid}, Recommended features count={len(report.recommended_features)}"
         })
 
-        emit(3, "Data Quality", "completed" if report.valid else "running", 
+        emit(4, "Data Quality Loop", "completed" if report.valid else "running", 
              f"Data quality audit completed. Valid={report.valid}, {len(report.problems)} problems identified.",
              {"quality_report": report.model_dump()})
 
@@ -192,10 +217,9 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
         iteration = state.get("data_quality_iteration", 1)
         report_data = state.get("data_quality_report", {})
         recommended = report_data.get("recommended_features", state["selected_features"])
-        emit(3, "Data Quality", "running", f"Applying remediation from iteration {iteration}. Pruning problematic features...")
+        emit(4, "Data Quality Loop", "running", f"Applying remediation from iteration {iteration}. Pruning problematic features...")
         return {
-            "selected_features": recommended,
-            "data_quality_iteration": iteration + 1
+            "selected_features": recommended
         }
 
     # Failed Node if 3 iterations exceeded
@@ -206,7 +230,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             f"Reasons: {[p['description'] for p in report_data.get('problems', [])]}. "
             f"Please inspect feature types, missingness, or target class labels."
         )
-        emit(3, "Data Quality", "failed", err)
+        emit(4, "Data Quality Loop", "failed", err)
         return {
             "errors": [err],
             "status": "failed"
@@ -215,7 +239,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
     # Node 5: split_dataset
     def split_dataset(state: MLWorkflowState) -> Dict[str, Any]:
         emit(4, "Dataset Splitting", "running", "Splitting dataset strictly into 70% Train, 15% Validation, 15% Test...")
-        df = pd.read_csv(state["dataset_path"])
+        df = get_cached_dataframe(state["dataset_path"])
         target_col = state["target_column"]
         y = df[target_col]
         indices = np.arange(len(df))
@@ -324,7 +348,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
     # Node 8: preprocessing_agent
     def preprocessing_agent_node(state: MLWorkflowState) -> Dict[str, Any]:
         emit(7, "Preprocessing", "running", "Building model-specific preprocessing pipelines...")
-        df = pd.read_csv(state["dataset_path"])
+        df = get_cached_dataframe(state["dataset_path"])
         sel_features = state["selected_features"]
         
         # Categorize feature types
@@ -346,14 +370,29 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
 
     # Node 9: model_selection_agent
     def model_selection_agent_node(state: MLWorkflowState) -> Dict[str, Any]:
+        cand_models = state.get("candidate_models", [])
+        total_models = len(cand_models)
+        families = list({m.get("model_family") for m in cand_models})
+        model_names = [m.get("model_name") for m in cand_models]
         emit(8, "Model Selection", "completed", 
-             f"Confirmed 5 candidate models across {len({m['model_family'] for m in state['candidate_models']})} distinct families.")
-        return {}
+             f"Confirmed {total_models} candidate models across {len(families)} distinct families: {', '.join(model_names)}.")
+
+        decisions = list(state.get("agent_decisions", []))
+        decisions.append({
+            "agent": "ModelSelectionAgent",
+            "decision": f"Validated candidate portfolio of {total_models} models",
+            "reason": f"Models span {len(families)} architectural families ({', '.join(families)}) ensuring search diversity.",
+            "input_statistics": f"{total_models} candidate models proposed",
+            "output_configuration": f"Models scheduled for optimization: {model_names}"
+        })
+        return {"agent_decisions": decisions}
 
     # Node 10: coarse_and_fine_optimization
     def optimize_models_node(state: MLWorkflowState) -> Dict[str, Any]:
-        emit(9, "Hyperparameter Optimization", "running", "Beginning coarse broad search and fine Bayesian optimization for 5 models...")
-        df = pd.read_csv(state["dataset_path"])
+        cand_models = state.get("candidate_models", [])
+        total_models = len(cand_models)
+        emit(9, "Hyperparameter Optimization", "running", f"Beginning coarse broad search and fine Bayesian optimization for {total_models} models...")
+        df = get_cached_dataframe(state["dataset_path"])
         train_df = df.iloc[state["train_indices"]]
         val_df = df.iloc[state["val_indices"]]
 
@@ -362,20 +401,33 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
         X_val = val_df[state["selected_features"]]
         y_val = val_df[state["target_column"]]
 
-        num_feats = state["preprocessing_configs"][state["candidate_models"][0]["model_name"]]["numeric_features"]
-        cat_feats = state["preprocessing_configs"][state["candidate_models"][0]["model_name"]]["categorical_features"]
+        num_feats = state["preprocessing_configs"][cand_models[0]["model_name"]]["numeric_features"]
+        cat_feats = state["preprocessing_configs"][cand_models[0]["model_name"]]["categorical_features"]
 
         model_results = []
         fitted_pipelines = {}
+        optimization_results = {}
 
-        for idx, model_cand in enumerate(state["candidate_models"]):
+        for idx, model_cand in enumerate(cand_models):
             m_name = model_cand["model_name"]
             m_fam = model_cand["model_family"]
             prep_strat = PreprocessingStrategy.model_validate(model_cand["preprocessing_strategy"])
             search_plan = get_search_plan_for_model(m_name, state["problem_type"])
 
             emit(9, "Hyperparameter Optimization", "running", 
-                 f"[{idx+1}/5] Optimizing {m_name} ({m_fam}). Coarse broad scan + Fine Bayesian tuning...")
+                 f"[{idx+1}/{total_models}] Optimizing {m_name} ({m_fam}). Coarse broad scan + Fine Bayesian tuning...")
+
+            def trial_progress(info: Dict[str, Any]):
+                stg = "Coarse Scan" if info.get("stage") == "coarse" else "Bayesian Tuning"
+                t_num = info.get("trial", 1)
+                t_tot = info.get("total", 8)
+                b_score = info.get("best_score", 0.0)
+                emit(
+                    9,
+                    "Hyperparameter Optimization",
+                    "running",
+                    f"[{idx+1}/{total_models}] {m_name} — {stg} Trial {t_num}/{t_tot} | Best {state['primary_metric'].upper()}: {b_score:.4f}"
+                )
 
             res = optimize_candidate_model(
                 model_name=m_name,
@@ -389,10 +441,12 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
                 y_train=y_train,
                 X_val=X_val,
                 y_val=y_val,
-                primary_metric=state["primary_metric"]
+                primary_metric=state["primary_metric"],
+                progress_callback=trial_progress
             )
 
             fitted_pipelines[m_name] = res["best_pipeline"]
+            optimization_results[m_name] = res.get("optimization_history", [])
 
             # Save clean serializable evaluation result
             eval_entry = {
@@ -408,12 +462,16 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             }
             model_results.append(eval_entry)
 
+        # Store in session registry for persistence across serialization
+        _SESSION_PIPELINES[state["session_id"]] = fitted_pipelines
+
         emit(9, "Hyperparameter Optimization", "completed", 
-             f"Hyperparameter optimization completed for all 5 candidate models.")
+             f"Hyperparameter optimization completed for all {total_models} candidate models.")
 
         return {
             "model_results": model_results,
-            "fitted_pipelines": fitted_pipelines
+            "fitted_pipelines": fitted_pipelines,
+            "optimization_results": optimization_results
         }
 
     # Node 11: validation_evaluation
@@ -444,7 +502,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             "agent": "ModelSelectionAgent",
             "decision": f"Selected Champion: {best['model_name']}",
             "reason": f"Achieved superior validation {p_metric.upper()} of {best['metrics'].get(p_metric, 0.0):.4f} with inference latency of {best['inference_time_ms']:.2f} ms.",
-            "input_statistics": f"5 evaluated models: {[r['model_name'] for r in results]}",
+            "input_statistics": f"{len(results)} evaluated models: {[r['model_name'] for r in results]}",
             "output_configuration": f"Best parameters: {best['best_hyperparameters']}"
         })
 
@@ -460,9 +518,9 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
     def final_test_evaluation_node(state: MLWorkflowState) -> Dict[str, Any]:
         emit(11, "Final Test Evaluation", "running", "Evaluating chosen pipeline on untouched 15% Test set...")
         best_name = state["best_model"]["model_name"]
-        pipeline = state["fitted_pipelines"][best_name]
+        pipeline = state.get("fitted_pipelines", {}).get(best_name) or _SESSION_PIPELINES.get(state["session_id"], {}).get(best_name)
 
-        df = pd.read_csv(state["dataset_path"])
+        df = get_cached_dataframe(state["dataset_path"])
         test_df = df.iloc[state["test_indices"]]
         X_test = test_df[state["selected_features"]]
         y_test = test_df[state["target_column"]]
@@ -478,8 +536,6 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
         is_classification = state["problem_type"] in ("binary_classification", "multiclass_classification")
 
         if is_classification:
-            # Confusion matrix
-            from sklearn.metrics import confusion_matrix
             y_true_np = y_test.to_numpy()
             y_pred_np = test_eval["y_pred"]
             classes = [str(c) for c in np.unique(y_true_np)]
@@ -488,7 +544,6 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
 
             # ROC curve for binary classification
             if len(classes) == 2 and test_eval["y_prob"] is not None:
-                from sklearn.metrics import roc_curve
                 prob_pos = test_eval["y_prob"][:, 1] if test_eval["y_prob"].ndim == 2 else test_eval["y_prob"]
                 fpr, tpr, _ = roc_curve(y_true_np, prob_pos)
                 plots["test_roc_curve"] = plot_roc_curve(fpr, tpr, test_eval["metrics"].get("roc_auc", 0.0))
@@ -508,7 +563,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
     def generate_report_node(state: MLWorkflowState) -> Dict[str, Any]:
         emit(12, "Model Artifact", "running", "Packaging full pipeline, metadata, schema, and generating executive report...")
         best_name = state["best_model"]["model_name"]
-        pipeline = state["fitted_pipelines"][best_name]
+        pipeline = state.get("fitted_pipelines", {}).get(best_name) or _SESSION_PIPELINES.get(state["session_id"], {}).get(best_name)
 
         report = run_report_agent(
             best_model_name=best_name,
@@ -589,7 +644,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             "validation_failed": "validation_failed"
         }
     )
-    builder.add_edge("handle_remediation", "data_quality_agent")
+    builder.add_edge("handle_remediation", "profile_dataset")
     builder.add_edge("validation_failed", END)
 
     # Forward Pipeline Execution
