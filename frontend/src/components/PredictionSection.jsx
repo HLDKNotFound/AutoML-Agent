@@ -128,21 +128,25 @@ export default function PredictionSection({
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th>ID</th>
-                    <th>PREDICT</th>
-                    {predictionResult.preview?.[0]?.probability_class_1 !== undefined && (
-                      <th>CLASS 1 PROBABILITY</th>
-                    )}
+                    {predictionResult.preview?.[0] && Object.keys(predictionResult.preview[0]).map((key) => (
+                      <th key={key}>{key.toUpperCase()}</th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
                   {predictionResult.preview?.map((row, idx) => (
                     <tr key={idx}>
-                      <td style={{ color: 'var(--text-secondary)' }}>{row.id}</td>
-                      <td style={{ fontWeight: 700, color: '#34d399' }}>{String(row.predict)}</td>
-                      {row.probability_class_1 !== undefined && (
-                        <td style={{ color: '#38bdf8' }}>{row.probability_class_1}</td>
-                      )}
+                      {Object.entries(row).map(([k, v], cellIdx) => (
+                        <td
+                          key={k}
+                          style={{
+                            color: cellIdx === 0 ? 'var(--text-secondary)' : cellIdx === 1 ? '#34d399' : '#38bdf8',
+                            fontWeight: cellIdx === 1 ? 700 : 400
+                          }}
+                        >
+                          {String(v)}
+                        </td>
+                      ))}
                     </tr>
                   ))}
                 </tbody>

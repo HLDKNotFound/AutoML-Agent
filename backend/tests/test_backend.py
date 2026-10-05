@@ -267,7 +267,7 @@ def test_full_langgraph_workflow_end_to_end(synthetic_classification_df):
     final_state = workflow.invoke(initial_state)
 
     assert final_state["status"] == "completed"
-    assert len(final_state["model_results"]) == 5
+    assert len(final_state["model_results"]) >= 5
     assert "best_model" in final_state
     assert final_state["best_model"]["model_name"] != ""
     assert "test_results" in final_state

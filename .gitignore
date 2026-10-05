@@ -1,4 +1,11 @@
 # ==============================================================================
+# AutoML Agentic System
+# 🏆 Kaggle Competition Benchmark Achievements:
+# - Spaceship Titanic: Rank 184 | Accuracy: 0.80851
+# - House Prices (Advanced Regression Techniques): Rank 1303 | RMSLE: 0.12764
+# ==============================================================================
+
+# ==============================================================================
 # Environment & Secrets (Crucial: Never commit credentials)
 # ==============================================================================
 .env
@@ -56,6 +63,15 @@ coverage.xml
 .hypothesis/
 .mypy_cache/
 .ruff_cache/
+
+# ==============================================================================
+# ML Frameworks, Training Logs & Cache
+# ==============================================================================
+catboost_info/
+lightning_logs/
+wandb/
+runs/
+.optuna/
 
 # ==============================================================================
 # ML Artifacts, Models & Serialized Binaries
@@ -118,5 +134,9 @@ Thumbs.db
 *.ntvs*
 *.njsproj
 *.sln
+
+# ==============================================================================
+# Local Kaggle Evaluation & Test Directories
+# ==============================================================================
 test_demo/
 test_house_pricing/

@@ -117,58 +117,51 @@ def run_ml_strategy_agent(
     if p_type in ("binary_classification", "multiclass_classification"):
         candidate_models = [
             ModelCandidate(
+                model_name="CatBoostClassifier",
+                model_family="gradient_boosting",
+                reason="Symmetric oblivious trees excelling at categorical interactions and resistant to overfitting.",
+                preprocessing_strategy=boosting_preprocessing
+            ),
+            ModelCandidate(
+                model_name="LGBMClassifier",
+                model_family="gradient_boosting",
+                reason="Fast leaf-wise gradient boosting with optimal split finding on continuous tabular features.",
+                preprocessing_strategy=boosting_preprocessing
+            ),
+            ModelCandidate(
                 model_name="RandomForestClassifier",
                 model_family="tree_ensemble",
-                reason="Robust ensemble capturing non-linear feature interactions and resistant to overfitting.",
+                reason="Robust bagging ensemble capturing non-linear feature interactions and variance reduction.",
                 preprocessing_strategy=tree_preprocessing
             ),
             ModelCandidate(
-                model_name="GradientBoostingClassifier",
-                model_family="gradient_boosting",
-                reason="Sequential boosting minimizing gradient loss for high predictive capacity.",
-                preprocessing_strategy=boosting_preprocessing
+                model_name="ExtraTreesClassifier",
+                model_family="tree_ensemble",
+                reason="Extremely randomized trees providing variance reduction and fast tabular fitting.",
+                preprocessing_strategy=tree_preprocessing
             ),
             ModelCandidate(
                 model_name="LogisticRegression",
                 model_family="linear",
                 reason="Interpretable linear baseline with L2 regularization and calibrated probabilities.",
                 preprocessing_strategy=linear_preprocessing
-            ),
+            )
         ]
-        if total_rows > 1500:
-            # Datasets with >1500 samples: replace slow O(N^3) SVC and instance KNN with high-speed scalable tree models
-            candidate_models.extend([
-                ModelCandidate(
-                    model_name="HistGradientBoostingClassifier",
-                    model_family="gradient_boosting",
-                    reason="High-efficiency histogram-based gradient boosting scaling gracefully to large tabular datasets.",
-                    preprocessing_strategy=boosting_preprocessing
-                ),
-                ModelCandidate(
-                    model_name="ExtraTreesClassifier",
-                    model_family="tree_ensemble",
-                    reason="Extremely randomized trees providing variance reduction and near-instant training on tabular data.",
-                    preprocessing_strategy=tree_preprocessing
-                )
-            ])
-        else:
-            candidate_models.extend([
-                ModelCandidate(
-                    model_name="SVC",
-                    model_family="support_vector",
-                    reason="Kernelized decision boundary effective in complex non-linear feature spaces.",
-                    preprocessing_strategy=kernel_preprocessing
-                ),
-                ModelCandidate(
-                    model_name="KNeighborsClassifier",
-                    model_family="neighbors",
-                    reason="Instance-based non-parametric classifier capturing localized data manifolds.",
-                    preprocessing_strategy=neighbors_preprocessing
-                )
-            ])
     else:
         # Regression models
         candidate_models = [
+            ModelCandidate(
+                model_name="CatBoostRegressor",
+                model_family="gradient_boosting",
+                reason="Gradient boosting optimized for tabular regression with oblivious trees and smooth gradients.",
+                preprocessing_strategy=boosting_preprocessing
+            ),
+            ModelCandidate(
+                model_name="LGBMRegressor",
+                model_family="gradient_boosting",
+                reason="High-efficiency gradient boosted regression trees with leaf-wise splitting.",
+                preprocessing_strategy=boosting_preprocessing
+            ),
             ModelCandidate(
                 model_name="RandomForestRegressor",
                 model_family="tree_ensemble",
@@ -176,48 +169,18 @@ def run_ml_strategy_agent(
                 preprocessing_strategy=tree_preprocessing
             ),
             ModelCandidate(
-                model_name="GradientBoostingRegressor",
-                model_family="gradient_boosting",
-                reason="Iterative boosting optimized for squared error and complex functional approximations.",
-                preprocessing_strategy=boosting_preprocessing
+                model_name="ExtraTreesRegressor",
+                model_family="tree_ensemble",
+                reason="Extremely randomized regression trees providing rapid training and high generalization.",
+                preprocessing_strategy=tree_preprocessing
             ),
             ModelCandidate(
                 model_name="Ridge",
                 model_family="linear",
                 reason="L2-regularized linear regression preventing coefficient explosion with multicollinearity.",
                 preprocessing_strategy=linear_preprocessing
-            ),
+            )
         ]
-        if total_rows > 1500:
-            candidate_models.extend([
-                ModelCandidate(
-                    model_name="HistGradientBoostingRegressor",
-                    model_family="gradient_boosting",
-                    reason="Fast histogram-based gradient boosting regression scaling to large tabular datasets.",
-                    preprocessing_strategy=boosting_preprocessing
-                ),
-                ModelCandidate(
-                    model_name="ExtraTreesRegressor",
-                    model_family="tree_ensemble",
-                    reason="Extremely randomized regression trees providing rapid training and high generalization.",
-                    preprocessing_strategy=tree_preprocessing
-                )
-            ])
-        else:
-            candidate_models.extend([
-                ModelCandidate(
-                    model_name="SVR",
-                    model_family="support_vector",
-                    reason="Epsilon-insensitive loss function effective in non-linear regression with margin boundaries.",
-                    preprocessing_strategy=kernel_preprocessing
-                ),
-                ModelCandidate(
-                    model_name="KNeighborsRegressor",
-                    model_family="neighbors",
-                    reason="Distance-weighted k-nearest neighbors regression for localized non-linear surfaces.",
-                    preprocessing_strategy=neighbors_preprocessing
-                )
-            ])
 
     reasoning = (
         f"Selected 5 distinct models across 5 model families ('tree_ensemble', 'gradient_boosting', "

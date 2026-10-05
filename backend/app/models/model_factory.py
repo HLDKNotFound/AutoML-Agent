@@ -52,30 +52,52 @@ def create_base_estimator(model_name: str, problem_type: str, params: Dict[str, 
             return GradientBoostingClassifier(random_state=config.random_state, **gb_params)
         return GradientBoostingRegressor(random_state=config.random_state, **gb_params)
 
-    # 3. LightGBM
+    # 4. LightGBM
     elif "lightgbm" in name or "lgbm" in name:
         try:
             import lightgbm as lgb
+            lgb_params = dict(params)
+            lgb_params.setdefault("verbose", -1)
+            lgb_params.setdefault("n_jobs", -1)
             if is_classification:
-                return lgb.LGBMClassifier(random_state=config.random_state, verbose=-1, **params)
-            return lgb.LGBMRegressor(random_state=config.random_state, verbose=-1, **params)
+                return lgb.LGBMClassifier(random_state=config.random_state, **lgb_params)
+            return lgb.LGBMRegressor(random_state=config.random_state, **lgb_params)
         except ImportError:
-            # Fallback to HistGradientBoosting
             if is_classification:
                 return HistGradientBoostingClassifier(random_state=config.random_state, **params)
             return HistGradientBoostingRegressor(random_state=config.random_state, **params)
 
-    # 4. XGBoost
+    # 5. XGBoost
     elif "xgboost" in name or "xgb" in name:
         try:
             import xgboost as xgb
+            xgb_params = dict(params)
+            xgb_params.setdefault("verbosity", 0)
+            xgb_params.setdefault("n_jobs", -1)
             if is_classification:
-                return xgb.XGBClassifier(random_state=config.random_state, eval_metric="logloss", **params)
-            return xgb.XGBRegressor(random_state=config.random_state, **params)
+                xgb_params.setdefault("eval_metric", "logloss")
+                return xgb.XGBClassifier(random_state=config.random_state, **xgb_params)
+            return xgb.XGBRegressor(random_state=config.random_state, **xgb_params)
         except ImportError:
             if is_classification:
                 return GradientBoostingClassifier(random_state=config.random_state, **params)
             return GradientBoostingRegressor(random_state=config.random_state, **params)
+
+    # 6. CatBoost
+    elif "catboost" in name or "cat" in name:
+        try:
+            from catboost import CatBoostClassifier, CatBoostRegressor
+            cat_params = dict(params)
+            cat_params.setdefault("verbose", 0)
+            cat_params.setdefault("thread_count", -1)
+            cat_params.setdefault("random_seed", config.random_state)
+            if is_classification:
+                return CatBoostClassifier(**cat_params)
+            return CatBoostRegressor(**cat_params)
+        except ImportError:
+            if is_classification:
+                return HistGradientBoostingClassifier(random_state=config.random_state, **params)
+            return HistGradientBoostingRegressor(random_state=config.random_state, **params)
 
     # 5. Linear / Logistic / Ridge
     elif "logistic" in name:

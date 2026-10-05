@@ -32,17 +32,33 @@ def get_search_plan_for_model(model_name: str, problem_type: str) -> Hyperparame
         }
         notes = "Tree ensemble: coarse broad depth scan followed by fine tuning of tree complexity."
 
-    # 2. Hist Gradient Boosting / LightGBM / XGBoost (Histogram-accelerated)
-    elif "histgradientboosting" in name or "lightgbm" in name or "xgboost" in name:
+    # 2. CatBoost
+    elif "catboost" in name or "cat" in name:
         coarse_space = {
-            "n_estimators": {"type": "int", "low": 30, "high": 180, "step": 30},
-            "learning_rate": {"type": "log_float", "low": 1e-3, "high": 0.3},
-            "max_depth": {"type": "int", "low": 3, "high": 10}
+            "iterations": {"type": "int", "low": 50, "high": 250, "step": 50},
+            "learning_rate": {"type": "log_float", "low": 0.01, "high": 0.2},
+            "depth": {"type": "int", "low": 4, "high": 8},
+            "l2_leaf_reg": {"type": "float", "low": 1.0, "high": 10.0}
         }
         fine_space = {
-            "n_estimators": {"type": "int", "low": 50, "high": 200, "step": 10},
-            "learning_rate": {"type": "log_float", "low": 5e-3, "high": 0.2},
+            "iterations": {"type": "int", "low": 80, "high": 300, "step": 20},
+            "learning_rate": {"type": "log_float", "low": 0.02, "high": 0.15},
+            "depth": {"type": "int", "low": 4, "high": 7},
+            "l2_leaf_reg": {"type": "float", "low": 2.0, "high": 8.0}
+        }
+        notes = "CatBoost: symmetric oblivious trees tuned for categorical feature interactions and regularization."
+
+    # 3. LightGBM / XGBoost / HistGradientBoosting (Histogram-accelerated)
+    elif "lightgbm" in name or "xgboost" in name or "histgradientboosting" in name:
+        coarse_space = {
+            "n_estimators": {"type": "int", "low": 40, "high": 180, "step": 35},
+            "learning_rate": {"type": "log_float", "low": 0.01, "high": 0.25},
             "max_depth": {"type": "int", "low": 3, "high": 8}
+        }
+        fine_space = {
+            "n_estimators": {"type": "int", "low": 60, "high": 200, "step": 20},
+            "learning_rate": {"type": "log_float", "low": 0.02, "high": 0.15},
+            "max_depth": {"type": "int", "low": 4, "high": 7}
         }
         notes = "Histogram GBDT: fast binning allows deep tree exploration."
 

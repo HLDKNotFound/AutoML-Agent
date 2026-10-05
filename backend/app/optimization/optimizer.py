@@ -41,7 +41,9 @@ def run_coarse_search(
     y_val: pd.Series,
     primary_metric: str,
     n_trials: int = 8,
-    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    transform_target_log: bool = False,
+    feature_engineer: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Stage 1: Coarse Broad Search.
@@ -79,7 +81,9 @@ def run_coarse_search(
             estimator,
             numeric_features=numeric_features,
             categorical_features=categorical_features,
-            strategy=preprocessing_strategy
+            strategy=preprocessing_strategy,
+            transform_target_log=transform_target_log,
+            feature_engineer=feature_engineer
         )
 
         try:
@@ -144,7 +148,9 @@ def run_fine_search(
     y_val: pd.Series,
     primary_metric: str,
     n_trials: int = 12,
-    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    transform_target_log: bool = False,
+    feature_engineer: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Stage 2: Fine Search via Bayesian Optimization (Optuna TPESampler).
@@ -202,7 +208,9 @@ def run_fine_search(
             estimator,
             numeric_features=numeric_features,
             categorical_features=categorical_features,
-            strategy=preprocessing_strategy
+            strategy=preprocessing_strategy,
+            transform_target_log=transform_target_log,
+            feature_engineer=feature_engineer
         )
 
         try:
@@ -266,12 +274,24 @@ def optimize_candidate_model(
     X_val: pd.DataFrame,
     y_val: pd.Series,
     primary_metric: str,
-    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    feature_engineer: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Executes end-to-end two-stage coarse-to-fine optimization for a single candidate model.
     """
     t_start = time.perf_counter()
+
+    # Detect right-skewed positive targets in regression (e.g. House Prices) for log1p optimization
+    transform_target_log = False
+    if problem_type == "regression":
+        try:
+            from scipy.stats import skew
+            clean_y = y_train.dropna()
+            if (clean_y > 0).all() and float(skew(clean_y)) > 0.75:
+                transform_target_log = True
+        except Exception:
+            pass
 
     # Stage 1: Coarse Search
     coarse_res = run_coarse_search(
@@ -287,7 +307,9 @@ def optimize_candidate_model(
         y_val=y_val,
         primary_metric=primary_metric,
         n_trials=config.coarse_search_trials,
-        progress_callback=progress_callback
+        progress_callback=progress_callback,
+        transform_target_log=transform_target_log,
+        feature_engineer=feature_engineer
     )
 
     # Stage 2: Fine Search (Bayesian Optimization refining coarse results)
@@ -305,7 +327,9 @@ def optimize_candidate_model(
         y_val=y_val,
         primary_metric=primary_metric,
         n_trials=config.fine_search_trials,
-        progress_callback=progress_callback
+        progress_callback=progress_callback,
+        transform_target_log=transform_target_log,
+        feature_engineer=feature_engineer
     )
 
     total_time = time.perf_counter() - t_start

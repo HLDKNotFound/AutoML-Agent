@@ -4,7 +4,7 @@ Assembles tailored scikit-learn ColumnTransformer and Pipeline instances for eac
 Guarantees zero data leakage by ensuring all fitting occurs strictly on training partitions.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Any
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 
@@ -63,11 +63,14 @@ def build_full_model_pipeline(
     model_estimator,
     numeric_features: List[str],
     categorical_features: List[str],
-    strategy: Optional[PreprocessingStrategy] = None
-) -> Pipeline:
+    strategy: Optional[PreprocessingStrategy] = None,
+    transform_target_log: bool = False,
+    feature_engineer: Optional[Any] = None
+):
     """
-    Returns an end-to-end Pipeline: ColumnTransformer -> Estimator.
-    This guarantees atomic fit, transform, and predict operations.
+    Returns an end-to-end Pipeline: FeatureEngineer (optional) -> ColumnTransformer -> Estimator.
+    If transform_target_log is True, wraps in TransformedTargetRegressor with log1p/expm1.
+    This guarantees atomic fit, transform, and predict operations with zero leakage.
     """
     preprocessor = build_preprocessing_pipeline(
         numeric_features=numeric_features,
@@ -75,9 +78,17 @@ def build_full_model_pipeline(
         strategy=strategy
     )
     
-    pipeline = Pipeline(steps=[
-        ("preprocessor", preprocessor),
-        ("model", model_estimator)
-    ])
+    steps = []
+    if feature_engineer is not None:
+        steps.append(("feature_engineer", feature_engineer))
+    steps.append(("preprocessor", preprocessor))
+    steps.append(("model", model_estimator))
+
+    pipeline = Pipeline(steps=steps)
+
+    if transform_target_log:
+        import numpy as np
+        from sklearn.compose import TransformedTargetRegressor
+        return TransformedTargetRegressor(regressor=pipeline, func=np.log1p, inverse_func=np.expm1)
     
     return pipeline

@@ -12,8 +12,9 @@ def get_categorical_encoder(encoder_type: str = "one_hot", handle_unknown: str =
     Ensures safe handling of unknown categories during inference.
     """
     encoder_type = (encoder_type or "one_hot").lower()
-    if encoder_type == "one_hot":
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    if encoder_type == "target":
+        from sklearn.preprocessing import TargetEncoder
+        return TargetEncoder(smooth="auto", cv=5)
     elif encoder_type == "ordinal":
         return OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
     return OneHotEncoder(handle_unknown="ignore", sparse_output=False)

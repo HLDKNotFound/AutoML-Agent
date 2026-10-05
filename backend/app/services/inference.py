@@ -8,6 +8,7 @@ Outputs standardized CSV formatted as `id,predict`.
 import io
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+import numpy as np
 import pandas as pd
 from backend.app.services.artifact_manager import load_model_artifact
 
@@ -34,13 +35,23 @@ def run_batch_inference(
 
     # 2. Extract or generate ID column
     id_col = None
-    for cand in ["id", "ID", "Id", "id_col"]:
+    id_col_name = "id"
+    for cand in ["PassengerId", "Id", "id", "ID", "id_col", "key", "index"]:
         if cand in df_input.columns:
             id_col = df_input[cand].values
+            id_col_name = cand
             break
             
     if id_col is None:
+        for c in df_input.columns:
+            if c.lower().endswith("id"):
+                id_col = df_input[c].values
+                id_col_name = c
+                break
+
+    if id_col is None:
         id_col = list(range(1, len(df_input) + 1))
+        id_col_name = "id"
 
     # 3. Extract feature matrix in precise order
     X_infer = df_input[expected_features]
@@ -48,21 +59,29 @@ def run_batch_inference(
     # 4. Predict using the full frozen pipeline (zero refitting)
     predictions = pipeline.predict(X_infer)
 
-    # 5. Build output DataFrame
+    # 5. Format predictions cleanly
+    target_col = metadata.get("target_column") or "predict"
+    p_type = metadata.get("problem_type")
+
+    # If regression, ensure valid non-negative values for positive metrics like prices
+    if p_type == "regression":
+        predictions = np.clip(predictions, a_min=0.0, a_max=None)
+    elif p_type == "binary_classification":
+        # Check if target values were boolean
+        if isinstance(predictions[0], (bool, np.bool_)):
+            predictions = [bool(p) for p in predictions]
+
+    # 6. Build output DataFrame preserving original ID name and target column
     output_df = pd.DataFrame({
-        "id": id_col,
-        "predict": predictions
+        id_col_name: id_col,
+        target_col: predictions
     })
 
-    # Optional: include class probabilities if classification
-    if metadata.get("problem_type") in ("binary_classification", "multiclass_classification"):
-        if hasattr(pipeline, "predict_proba"):
-            try:
-                probs = pipeline.predict_proba(X_infer)
-                if probs.ndim == 2 and probs.shape[1] == 2:
-                    output_df["probability_class_1"] = probs[:, 1].round(4)
-            except Exception:
-                pass
+    # Ensure backward compatibility aliases for clients expecting 'id' and 'predict'
+    if "id" not in output_df.columns:
+        output_df["id"] = id_col
+    if "predict" not in output_df.columns:
+        output_df["predict"] = predictions
 
     summary = {
         "session_id": session_id,

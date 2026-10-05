@@ -32,6 +32,8 @@ from backend.app.agents.report_agent import run_report_agent
 from backend.app.optimization.optimizer import optimize_candidate_model
 from backend.app.evaluation.evaluator import evaluate_pipeline
 from backend.app.services.artifact_manager import save_model_artifact
+from backend.app.preprocessing.feature_engineer import TabularFeatureEngineer
+from backend.app.models.ensemble import EnsembleBlendPipeline
 
 # In-memory DataFrame cache and session pipeline store
 _DATAFRAME_CACHE: Dict[str, pd.DataFrame] = {}
@@ -88,6 +90,7 @@ class MLWorkflowState(TypedDict):
     test_results: Dict[str, Any]
 
     fitted_pipelines: Dict[str, Any]
+    feature_engineer: Optional[Any]
     plots: Dict[str, str]
     artifacts: Dict[str, Any]
     errors: List[str]
@@ -350,10 +353,16 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
         emit(7, "Preprocessing", "running", "Building model-specific preprocessing pipelines...")
         df = get_cached_dataframe(state["dataset_path"])
         sel_features = state["selected_features"]
+        train_df = df.iloc[state["train_indices"]]
         
-        # Categorize feature types
-        numeric = [c for c in sel_features if pd.api.types.is_numeric_dtype(df[c])]
-        categorical = [c for c in sel_features if c not in numeric]
+        # Fit TabularFeatureEngineer strictly on train partition to eliminate data leakage
+        fe = TabularFeatureEngineer()
+        fe.fit(train_df[sel_features])
+        X_train_fe = fe.transform(train_df[sel_features])
+        
+        # Categorize feature types from the engineered schema
+        numeric = [c for c in X_train_fe.columns if pd.api.types.is_numeric_dtype(X_train_fe[c])]
+        categorical = [c for c in X_train_fe.columns if c not in numeric]
 
         configs = {}
         for m in state["candidate_models"]:
@@ -364,9 +373,12 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             }
 
         emit(7, "Preprocessing", "completed", 
-             f"Model-specific preprocessing constructed: {len(numeric)} numeric, {len(categorical)} categorical features.")
+             f"Model-specific preprocessing constructed with automated feature engineering: {len(numeric)} numeric, {len(categorical)} categorical features.")
 
-        return {"preprocessing_configs": configs}
+        return {
+            "preprocessing_configs": configs,
+            "feature_engineer": fe
+        }
 
     # Node 9: model_selection_agent
     def model_selection_agent_node(state: MLWorkflowState) -> Dict[str, Any]:
@@ -400,6 +412,11 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
         y_train = train_df[state["target_column"]]
         X_val = val_df[state["selected_features"]]
         y_val = val_df[state["target_column"]]
+
+        fe = state.get("feature_engineer")
+        if fe is None:
+            fe = TabularFeatureEngineer()
+            fe.fit(X_train)
 
         num_feats = state["preprocessing_configs"][cand_models[0]["model_name"]]["numeric_features"]
         cat_feats = state["preprocessing_configs"][cand_models[0]["model_name"]]["categorical_features"]
@@ -442,7 +459,8 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
                 X_val=X_val,
                 y_val=y_val,
                 primary_metric=state["primary_metric"],
-                progress_callback=trial_progress
+                progress_callback=trial_progress,
+                feature_engineer=fe
             )
 
             fitted_pipelines[m_name] = res["best_pipeline"]
@@ -462,11 +480,60 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             }
             model_results.append(eval_entry)
 
+        # Construct and evaluate Top Models Ensemble Blend
+        if len(model_results) >= 2:
+            p_metric = state["primary_metric"]
+            is_error_metric = p_metric in ("rmse", "mse", "mae", "mape", "log_loss")
+            sorted_models = sorted(
+                model_results,
+                key=lambda r: r["metrics"].get(p_metric, float("inf") if is_error_metric else -float("inf")),
+                reverse=not is_error_metric
+            )
+            top_k = min(3, len(sorted_models))
+            top_models = sorted_models[:top_k]
+            top_names = [m["model_name"] for m in top_models]
+            ensemble_estimators = [(name, fitted_pipelines[name]) for name in top_names]
+            
+            # Rank-weighted blending
+            weights = [1.0 / (i + 1) for i in range(top_k)]
+            ensemble_pipe = EnsembleBlendPipeline(
+                estimators=ensemble_estimators,
+                weights=weights,
+                problem_type=state["problem_type"]
+            )
+            
+            ens_eval = evaluate_pipeline(
+                pipeline=ensemble_pipe,
+                X_val=X_val,
+                y_val=y_val,
+                problem_type=state["problem_type"],
+                train_time_sec=sum(m["train_time_sec"] for m in top_models)
+            )
+            
+            ensemble_name = f"Ensemble Blend ({' + '.join(top_names[:2])})"
+            fitted_pipelines[ensemble_name] = ensemble_pipe
+            
+            ensemble_entry = {
+                "model_name": ensemble_name,
+                "model_family": "EnsembleBlend",
+                "metrics": ens_eval["metrics"],
+                "train_time_sec": sum(m["train_time_sec"] for m in top_models),
+                "inference_time_ms": ens_eval["inference_time_ms"],
+                "model_size_kb": sum(m["model_size_kb"] for m in top_models),
+                "best_hyperparameters": {"blended_models": top_names, "weights": weights},
+                "preprocessing_summary": {"ensemble_type": "soft_blend", "top_models": top_names},
+                "status": "completed"
+            }
+            model_results.append(ensemble_entry)
+
+            emit(9, "Hyperparameter Optimization", "running",
+                 f"Ensemble Blend constructed from {len(top_names)} top models: validation {p_metric.upper()}={ens_eval['metrics'].get(p_metric, 0.0):.4f}.")
+
         # Store in session registry for persistence across serialization
         _SESSION_PIPELINES[state["session_id"]] = fitted_pipelines
 
         emit(9, "Hyperparameter Optimization", "completed", 
-             f"Hyperparameter optimization completed for all {total_models} candidate models.")
+             f"Hyperparameter optimization completed for all {total_models} candidate models plus Ensemble Blend.")
 
         return {
             "model_results": model_results,
