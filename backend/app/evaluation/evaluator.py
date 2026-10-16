@@ -16,6 +16,11 @@ from sklearn.metrics import (
     mean_absolute_error, mean_squared_error, r2_score,
     mean_absolute_percentage_error, roc_curve, precision_recall_curve
 )
+from sklearn.dummy import DummyClassifier, DummyRegressor
+from backend.app.evaluation.metric_registry import (
+    METRIC_REGISTRY, MetricDefinition, get_metric_definition,
+    is_metric_better, get_optimization_score, validate_metric_compatibility
+)
 
 
 def compute_classification_metrics(
@@ -133,3 +138,32 @@ def evaluate_pipeline(
         "y_pred": y_pred,
         "y_prob": y_prob
     }
+
+
+def evaluate_dummy_baseline(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    problem_type: str
+) -> Dict[str, Any]:
+    """
+    Fits and evaluates a simple heuristic baseline (DummyClassifier or DummyRegressor)
+    to provide an un-inflated, rigorous baseline anchor for all candidate models.
+    """
+    t_start = time.perf_counter()
+    if problem_type in ("binary_classification", "multiclass_classification"):
+        dummy = DummyClassifier(strategy="prior")
+    else:
+        dummy = DummyRegressor(strategy="mean")
+
+    dummy.fit(X_train, y_train)
+    fit_time = time.perf_counter() - t_start
+
+    eval_res = evaluate_pipeline(dummy, X_val, y_val, problem_type, train_time_sec=fit_time)
+    eval_res["model_name"] = "DummyBaseline"
+    eval_res["model_family"] = "baseline"
+    eval_res["best_hyperparameters"] = {"strategy": "prior" if "classification" in problem_type else "mean"}
+    eval_res["preprocessing_summary"] = {"baseline": "heuristic_prior"}
+    eval_res["status"] = "completed"
+    return eval_res

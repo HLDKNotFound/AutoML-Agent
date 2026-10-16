@@ -11,7 +11,8 @@ import pandas as pd
 def compute_dataset_profile(
     df: pd.DataFrame,
     target_column: Optional[str] = None,
-    feature_columns: Optional[List[str]] = None
+    feature_columns: Optional[List[str]] = None,
+    user_problem_type: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Analyzes the dataframe and produces detailed structured statistics for profiling and LLM analysis.
@@ -151,50 +152,107 @@ def compute_dataset_profile(
     # Target Analysis
     target_stats = {}
     problem_type_guess = "binary_classification"
+    is_ambiguous = False
+    ambiguity_reason = ""
+
     if target_column and target_column in df.columns:
         target_series = df[target_column].dropna()
         n_unique_target = int(target_series.nunique())
-        
-        # Determine if target is numeric and continuous
-        is_num = pd.api.types.is_numeric_dtype(target_series)
-        
-        if is_num and n_unique_target > 20:
-            problem_type_guess = "regression"
+        total_target_count = len(target_series)
+
+        if n_unique_target <= 1:
+            problem_type_guess = "constant_target"
             target_stats = {
-                "type": "regression",
-                "mean": float(target_series.mean()),
-                "median": float(target_series.median()),
-                "std": float(target_series.std(ddof=1)) if len(target_series) > 1 else 0.0,
-                "variance": float(target_series.var(ddof=1)) if len(target_series) > 1 else 0.0,
-                "min": float(target_series.min()),
-                "max": float(target_series.max()),
-                "skewness": float(target_series.skew()) if len(target_series) > 2 else 0.0,
-                "missing_count": int(df[target_column].isna().sum())
+                "type": "constant_target",
+                "num_classes": n_unique_target,
+                "is_constant": True,
+                "missing_count": int(df[target_column].isna().sum()),
+                "error": f"Target column '{target_column}' is constant with only {n_unique_target} unique value. Model training is impossible."
             }
         else:
-            val_counts = target_series.value_counts()
-            class_dist = {str(k): int(v) for k, v in val_counts.items()}
-            class_pcts = {str(k): round(float(v / len(target_series)), 4) for k, v in val_counts.items()}
+            is_num = pd.api.types.is_numeric_dtype(target_series)
             
-            # Imbalance ratio: min_class / max_class
-            imbalance_ratio = float(val_counts.min() / val_counts.max()) if val_counts.max() > 0 else 1.0
-            
-            if n_unique_target == 2:
-                problem_type_guess = "binary_classification"
+            # 1. Check if user provided an explicit task type
+            if user_problem_type:
+                upt = user_problem_type.strip().lower()
+                if "regress" in upt:
+                    if not is_num:
+                        try:
+                            pd.to_numeric(target_series, errors="raise")
+                        except Exception:
+                            raise ValueError(f"User requested regression, but target column '{target_column}' contains non-numeric strings.")
+                    problem_type_guess = "regression"
+                elif "bin" in upt or (upt == "classification" and n_unique_target == 2):
+                    problem_type_guess = "binary_classification"
+                else:
+                    problem_type_guess = "multiclass_classification" if n_unique_target > 2 else "binary_classification"
             else:
-                problem_type_guess = "multiclass_classification"
-                
-            target_stats = {
-                "type": problem_type_guess,
-                "num_classes": n_unique_target,
-                "class_counts": class_dist,
-                "class_proportions": class_pcts,
-                "imbalance_ratio": round(imbalance_ratio, 4),
-                "is_imbalanced": bool(imbalance_ratio < 0.25),
-                "missing_count": int(df[target_column].isna().sum())
-            }
+                # 2. Multi-criteria automatic inference
+                if not is_num or pd.api.types.is_bool_dtype(target_series):
+                    # Categorical / string / boolean targets are always classification
+                    problem_type_guess = "binary_classification" if n_unique_target == 2 else "multiclass_classification"
+                else:
+                    # Numeric target
+                    vals = target_series.to_numpy(dtype=float)
+                    has_fractional = bool(np.any(np.mod(vals, 1.0) != 0.0))
 
-        # Check for potential target leakage in features
+                    if n_unique_target == 2 and set(np.unique(vals)).issubset({0.0, 1.0, -1.0, 2.0}):
+                        problem_type_guess = "binary_classification"
+                    elif has_fractional:
+                        # Continuous values with decimal fractions -> regression regardless of sample size
+                        problem_type_guess = "regression"
+                    elif n_unique_target > 20:
+                        # Integer with high cardinality -> regression
+                        problem_type_guess = "regression"
+                    elif n_unique_target <= 5:
+                        # Discrete small integer set (e.g., classes 0, 1, 2) -> classification
+                        problem_type_guess = "binary_classification" if n_unique_target == 2 else "multiclass_classification"
+                    else:
+                        # Ambiguous zone: integer target with 6-20 unique values (e.g. ratings 1-10 or age counts)
+                        is_ambiguous = True
+                        val_range = float(vals.max() - vals.min())
+                        if val_range > 15:
+                            problem_type_guess = "regression"
+                            ambiguity_reason = f"Target has {n_unique_target} discrete integer values across span {val_range:.0f}. Inferred regression as suggestion."
+                        else:
+                            problem_type_guess = "multiclass_classification"
+                            ambiguity_reason = f"Target has {n_unique_target} discrete classes. Inferred multiclass classification as suggestion."
+
+            # Compute detailed statistics according to inferred type
+            if problem_type_guess == "regression":
+                target_stats = {
+                    "type": "regression",
+                    "mean": float(target_series.mean()),
+                    "median": float(target_series.median()),
+                    "std": float(target_series.std(ddof=1)) if len(target_series) > 1 else 0.0,
+                    "variance": float(target_series.var(ddof=1)) if len(target_series) > 1 else 0.0,
+                    "min": float(target_series.min()),
+                    "max": float(target_series.max()),
+                    "skewness": float(target_series.skew()) if len(target_series) > 2 else 0.0,
+                    "unique_values": n_unique_target,
+                    "missing_count": int(df[target_column].isna().sum()),
+                    "is_ambiguous": is_ambiguous,
+                    "ambiguity_reason": ambiguity_reason
+                }
+            else:
+                val_counts = target_series.value_counts()
+                class_dist = {str(k): int(v) for k, v in val_counts.items()}
+                class_pcts = {str(k): round(float(v / len(target_series)), 4) for k, v in val_counts.items()}
+                imbalance_ratio = float(val_counts.min() / val_counts.max()) if val_counts.max() > 0 else 1.0
+
+                target_stats = {
+                    "type": problem_type_guess,
+                    "num_classes": n_unique_target,
+                    "class_counts": class_dist,
+                    "class_proportions": class_pcts,
+                    "imbalance_ratio": round(imbalance_ratio, 4),
+                    "is_imbalanced": bool(imbalance_ratio < 0.25),
+                    "missing_count": int(df[target_column].isna().sum()),
+                    "is_ambiguous": is_ambiguous,
+                    "ambiguity_reason": ambiguity_reason
+                }
+
+        # Check for potential target leakage in features (documented as risk for review)
         potential_leakage = []
         for col in numeric_features:
             if col != target_column:
@@ -208,7 +266,7 @@ def compute_dataset_profile(
                             potential_leakage.append({
                                 "feature": col,
                                 "correlation_with_target": round(corr_with_target, 4),
-                                "reason": "Extremely high linear correlation with target"
+                                "reason": "Extremely high linear correlation with target (>0.96); flagged for review as possible leakage or proxy variable"
                             })
                 except Exception:
                     pass
@@ -220,7 +278,7 @@ def compute_dataset_profile(
                     potential_leakage.append({
                         "feature": col,
                         "correlation_with_target": 1.0,
-                        "reason": "Exact identical values to target"
+                        "reason": "Exact identical string values to target; confirmed data leakage"
                     })
         target_stats["potential_leakage"] = potential_leakage
 

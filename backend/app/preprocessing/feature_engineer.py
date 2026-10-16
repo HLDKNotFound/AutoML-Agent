@@ -1,10 +1,14 @@
 """
 Automated Tabular Feature Engineering Module.
-Extracts high-impact domain and interaction features for tabular classification and regression.
+Extracts generally valid tabular features:
+1. Structured string decomposition (slash/dash/colon delimited strings).
+2. Datetime components (month, day, dayofweek, is_weekend, hour).
+3. Missingness indicators for partially missing attributes.
+4. Numerical interaction terms (products and safe ratios).
 Conforms strictly to scikit-learn BaseEstimator and TransformerMixin for zero-leakage pipeline integration.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -12,156 +16,153 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 class TabularFeatureEngineer(BaseEstimator, TransformerMixin):
     """
-    Automated feature engineer that discovers and creates high-leverage tabular features:
-    1. Delimited string decomposition (e.g. 'Cabin' -> deck, num, side).
-    2. Group identifier & size features (e.g. 'PassengerId' -> group_size, is_alone).
-    3. Additive numerical aggregations (e.g. TotalSF, TotalBath, TotalExpenses).
-    4. Age and temporal span features (e.g. YrSold - YearBuilt).
-    5. Presence indicator flags (e.g. HasPool, HasGarage, HasExpenses).
+    Generally valid automated feature engineer for tabular data.
+    Separates general tabular transformations from domain-specific heuristics.
+    Guarantees no column name collisions, idempotent transforms, and deterministic column order.
     """
 
-    def __init__(self):
-        self.slash_delimited_cols: List[str] = []
-        self.grouped_id_cols: List[str] = []
-        self.group_frequencies_: Dict[str, Dict[str, int]] = {}
-        self.expense_cols_: List[str] = []
-        self.house_sf_cols_: List[str] = []
-        self.bath_cols_: Dict[str, str] = {}
-        self.age_cols_: Dict[str, str] = {}
-        self.porch_cols_: List[str] = []
-        self.presence_cols_: List[str] = []
+    def __init__(self, enable_interactions: bool = False, enable_missing_indicators: bool = True):
+        self.enable_interactions = enable_interactions
+        self.enable_missing_indicators = enable_missing_indicators
+
+        self.delimited_cols_: List[Tuple[str, str]] = []  # (column_name, delimiter)
+        self.datetime_cols_: List[str] = []
+        self.missing_indicator_cols_: List[str] = []
+        self.interaction_pairs_: List[Tuple[str, str]] = []
+        self.fitted_columns_: List[str] = []
+        self.output_feature_names_: List[str] = []
         self.is_fitted_: bool = False
 
     def fit(self, X, y=None):
         if not isinstance(X, pd.DataFrame):
             X = pd.DataFrame(X)
 
-        self.slash_delimited_cols = []
-        self.grouped_id_cols = []
-        self.group_frequencies_ = {}
+        self.fitted_columns_ = list(X.columns)
+        self.delimited_cols_ = []
+        self.datetime_cols_ = []
+        self.missing_indicator_cols_ = []
+        self.interaction_pairs_ = []
 
         cols = list(X.columns)
+        n_rows = len(X)
 
-        # 1. Delimited column detection (e.g. Cabin = 'B/0/P')
         for col in cols:
-            if X[col].dtype == object or str(X[col].dtype) == "string":
-                sample = X[col].dropna().astype(str).head(100)
-                if len(sample) > 10 and (sample.str.count("/") >= 1).mean() > 0.6:
-                    self.slash_delimited_cols.append(col)
+            series = X[col]
+            # 1. Delimited string detection (e.g. "A/12/P" or "2024-05")
+            if series.dtype == object or str(series.dtype) == "string":
+                sample = series.dropna().astype(str).head(100)
+                if len(sample) >= 10:
+                    for delim in ["/", "-", ":", "_"]:
+                        counts = sample.str.count(delim)
+                        if (counts >= 1).mean() > 0.70 and counts.nunique() <= 3:
+                            self.delimited_cols_.append((col, delim))
+                            break
 
-        # 2. Group ID detection (e.g. '0001_01')
-        for col in cols:
-            if X[col].dtype == object or str(X[col].dtype) == "string":
-                sample = X[col].dropna().astype(str).head(100)
-                if len(sample) > 10 and sample.str.contains(r"^\w+_\d+$").mean() > 0.7:
-                    self.grouped_id_cols.append(col)
-                    group_ids = X[col].dropna().astype(str).str.split("_").str[0]
-                    self.group_frequencies_[col] = group_ids.value_counts().to_dict()
+            # 2. Datetime detection
+            if pd.api.types.is_datetime64_any_dtype(series.dtype):
+                self.datetime_cols_.append(col)
+            elif series.dtype == object or str(series.dtype) == "string":
+                sample = series.dropna().astype(str).head(50)
+                if len(sample) >= 10:
+                    try:
+                        converted = pd.to_datetime(sample, errors="coerce", format="mixed")
+                        if converted.notna().mean() > 0.85:
+                            self.datetime_cols_.append(col)
+                    except Exception:
+                        pass
 
-        # 3. Specific high-impact domain aggregations
-        # A. Luxury Expenses (Spaceship Titanic / Churn / Travel)
-        exp_candidates = ["RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"]
-        self.expense_cols_ = [c for c in exp_candidates if c in cols]
+            # 3. Missingness indicators for moderate missingness (5% to 50%)
+            if self.enable_missing_indicators and n_rows > 0:
+                missing_pct = float(series.isna().mean())
+                if 0.05 <= missing_pct <= 0.50:
+                    self.missing_indicator_cols_.append(col)
 
-        # B. Housing Total Area (House Prices)
-        sf_candidates = ["TotalBsmtSF", "1stFlrSF", "2ndFlrSF"]
-        if all(c in cols for c in sf_candidates):
-            self.house_sf_cols_ = sf_candidates
-        elif "GrLivArea" in cols and "TotalBsmtSF" in cols:
-            self.house_sf_cols_ = ["GrLivArea", "TotalBsmtSF"]
-        else:
-            self.house_sf_cols_ = []
+        # 4. Optional numeric interactions
+        if self.enable_interactions:
+            numeric_cols = [c for c in cols if pd.api.types.is_numeric_dtype(X[c].dtype)]
+            if len(numeric_cols) >= 2:
+                # Select top 3 highest-variance numerical columns to avoid combinatorial explosion
+                variances = {c: float(X[c].dropna().var()) for c in numeric_cols if len(X[c].dropna()) > 1}
+                top_numeric = sorted(variances.keys(), key=lambda c: variances[c], reverse=True)[:3]
+                for i in range(len(top_numeric)):
+                    for j in range(i + 1, len(top_numeric)):
+                        self.interaction_pairs_.append((top_numeric[i], top_numeric[j]))
 
-        # C. Housing Total Bathrooms
-        bath_map = {}
-        for b_cand in ["FullBath", "HalfBath", "BsmtFullBath", "BsmtHalfBath"]:
-            if b_cand in cols:
-                bath_map[b_cand] = b_cand
-        self.bath_cols_ = bath_map
-
-        # D. Age calculations
-        if "YrSold" in cols and "YearBuilt" in cols:
-            self.age_cols_["HouseAge"] = ("YrSold", "YearBuilt")
-        if "YrSold" in cols and "YearRemodAdd" in cols:
-            self.age_cols_["RemodAge"] = ("YrSold", "YearRemodAdd")
-
-        # E. Porch aggregations
-        porch_cands = ["OpenPorchSF", "EnclosedPorch", "3SsnPorch", "ScreenPorch", "WoodDeckSF"]
-        self.porch_cols_ = [c for c in porch_cands if c in cols]
-
-        # F. Presence flags
-        pres_cands = ["PoolArea", "GarageArea", "TotalBsmtSF", "Fireplaces", "2ndFlrSF", "WoodDeckSF"]
-        self.presence_cols_ = [c for c in pres_cands if c in cols]
-
+        # Precompute expected output feature names
+        dummy_transformed = self._transform_internal(X.head(5))
+        self.output_feature_names_ = list(dummy_transformed.columns)
         self.is_fitted_ = True
         return self
 
-    def transform(self, X) -> pd.DataFrame:
-        if not isinstance(X, pd.DataFrame):
-            X = pd.DataFrame(X)
-        X_out = X.copy()
+    def _transform_internal(self, X_df: pd.DataFrame) -> pd.DataFrame:
+        """Internal transform logic ensuring no column name collisions and safe derived values."""
+        X_out = X_df.copy()
+        existing_cols: Set[str] = set(X_out.columns)
 
         # 1. Delimited string decomposition
-        for col in self.slash_delimited_cols:
+        for col, delim in self.delimited_cols_:
             if col in X_out.columns:
-                parts = X_out[col].astype(str).str.split("/", expand=True)
-                if parts.shape[1] >= 2:
-                    X_out[f"{col}_part0"] = parts[0].replace("nan", np.nan).replace("None", np.nan)
-                    X_out[f"{col}_part1"] = pd.to_numeric(parts[1], errors="coerce")
-                if parts.shape[1] >= 3:
-                    X_out[f"{col}_part2"] = parts[2].replace("nan", np.nan).replace("None", np.nan)
+                parts = X_out[col].astype(str).str.split(delim, expand=True)
+                n_parts = min(parts.shape[1], 4)
+                for i in range(n_parts):
+                    new_col = f"{col}_part_{i}"
+                    if new_col not in existing_cols:
+                        series_part = parts[i].replace("nan", np.nan).replace("None", np.nan)
+                        # Auto-convert to numeric if possible
+                        try:
+                            X_out[new_col] = pd.to_numeric(series_part)
+                        except Exception:
+                            X_out[new_col] = series_part
+                        existing_cols.add(new_col)
 
-        # 2. Group ID features
-        for col in self.grouped_id_cols:
+        # 2. Datetime feature extraction
+        for col in self.datetime_cols_:
             if col in X_out.columns:
-                group_prefix = X_out[col].astype(str).str.split("_").str[0]
-                freq_map = self.group_frequencies_.get(col, {})
-                group_size = group_prefix.map(freq_map).fillna(1.0).astype(float)
-                X_out[f"{col}_group_size"] = group_size
-                X_out[f"{col}_is_alone"] = (group_size == 1.0).astype(float)
+                dt_series = pd.to_datetime(X_out[col], errors="coerce")
+                for feat, name in [
+                    (dt_series.dt.month, f"{col}_month"),
+                    (dt_series.dt.day, f"{col}_day"),
+                    (dt_series.dt.dayofweek, f"{col}_dayofweek"),
+                    ((dt_series.dt.dayofweek >= 5).astype(float), f"{col}_is_weekend"),
+                    (dt_series.dt.hour, f"{col}_hour")
+                ]:
+                    if name not in existing_cols:
+                        X_out[name] = feat.fillna(-1.0)
+                        existing_cols.add(name)
 
-        # 3. Additive aggregations
-        if len(self.expense_cols_) >= 2:
-            exp_sum = pd.Series(0.0, index=X_out.index)
-            for c in self.expense_cols_:
-                exp_sum += pd.to_numeric(X_out[c], errors="coerce").fillna(0.0)
-            X_out["TotalExpenses"] = exp_sum
-            X_out["HasExpenses"] = (exp_sum > 0.0).astype(float)
+        # 3. Missingness indicator flags
+        for col in self.missing_indicator_cols_:
+            if col in X_out.columns:
+                name = f"{col}_is_missing"
+                if name not in existing_cols:
+                    X_out[name] = X_out[col].isna().astype(float)
+                    existing_cols.add(name)
 
-        if self.house_sf_cols_:
-            sf_sum = pd.Series(0.0, index=X_out.index)
-            for c in self.house_sf_cols_:
-                sf_sum += pd.to_numeric(X_out[c], errors="coerce").fillna(0.0)
-            X_out["TotalSF"] = sf_sum
-
-        if self.bath_cols_:
-            bath_total = pd.Series(0.0, index=X_out.index)
-            if "FullBath" in self.bath_cols_:
-                bath_total += pd.to_numeric(X_out["FullBath"], errors="coerce").fillna(0.0)
-            if "HalfBath" in self.bath_cols_:
-                bath_total += 0.5 * pd.to_numeric(X_out["HalfBath"], errors="coerce").fillna(0.0)
-            if "BsmtFullBath" in self.bath_cols_:
-                bath_total += pd.to_numeric(X_out["BsmtFullBath"], errors="coerce").fillna(0.0)
-            if "BsmtHalfBath" in self.bath_cols_:
-                bath_total += 0.5 * pd.to_numeric(X_out["BsmtHalfBath"], errors="coerce").fillna(0.0)
-            X_out["TotalBath"] = bath_total
-
-        for out_name, (col1, col2) in self.age_cols_.items():
-            if col1 in X_out.columns and col2 in X_out.columns:
-                c1 = pd.to_numeric(X_out[col1], errors="coerce")
-                c2 = pd.to_numeric(X_out[col2], errors="coerce")
-                diff = c1 - c2
-                X_out[out_name] = diff.clip(lower=0.0)
-
-        if len(self.porch_cols_) >= 2:
-            p_sum = pd.Series(0.0, index=X_out.index)
-            for c in self.porch_cols_:
-                p_sum += pd.to_numeric(X_out[c], errors="coerce").fillna(0.0)
-            X_out["TotalPorchSF"] = p_sum
-
-        for c in self.presence_cols_:
-            if c in X_out.columns:
-                val = pd.to_numeric(X_out[c], errors="coerce").fillna(0.0)
-                X_out[f"Has_{c}"] = (val > 0.0).astype(float)
+        # 4. Numeric interactions
+        for c1, c2 in self.interaction_pairs_:
+            if c1 in X_out.columns and c2 in X_out.columns:
+                prod_name = f"{c1}_x_{c2}"
+                if prod_name not in existing_cols:
+                    s1 = pd.to_numeric(X_out[c1], errors="coerce").fillna(0.0)
+                    s2 = pd.to_numeric(X_out[c2], errors="coerce").fillna(0.0)
+                    X_out[prod_name] = s1 * s2
+                    existing_cols.add(prod_name)
 
         return X_out
+
+    def transform(self, X) -> pd.DataFrame:
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X, columns=self.fitted_columns_ if self.fitted_columns_ and len(X[0]) == len(self.fitted_columns_) else None)
+
+        X_out = self._transform_internal(X)
+
+        # Ensure all columns fitted during training exist; fill missing columns if any
+        if self.is_fitted_ and self.output_feature_names_:
+            for col in self.output_feature_names_:
+                if col not in X_out.columns:
+                    X_out[col] = 0.0
+
+        return X_out
+
+    def get_feature_names_out(self, input_features=None) -> np.ndarray:
+        return np.array(self.output_feature_names_, dtype=object)

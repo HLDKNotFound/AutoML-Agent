@@ -389,3 +389,69 @@ def test_endpoints_improvements():
     SESSIONS.pop("fresh_sess", None)
 
 
+def test_extended_preprocessing_and_models(synthetic_classification_df):
+    from backend.templates.numerical.scaling import get_numeric_scaler, get_numeric_imputer
+    from backend.templates.missing.imputers import create_imputer
+    from backend.app.models.model_factory import create_base_estimator
+    from backend.app.agents.hyperparameter_agent import get_search_plan_for_model
+    from backend.app.preprocessing.pipeline_builder import build_full_model_pipeline
+    from backend.app.schemas.ml_schemas import PreprocessingStrategy
+    from sklearn.preprocessing import PowerTransformer, Normalizer
+    from sklearn.experimental import enable_iterative_imputer
+    from sklearn.impute import IterativeImputer
+    from sklearn.ensemble import AdaBoostClassifier
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.naive_bayes import GaussianNB
+
+    # 1. Test extended scalers
+    power_scaler = get_numeric_scaler("power")
+    assert isinstance(power_scaler, PowerTransformer)
+    norm_scaler = get_numeric_scaler("normalizer")
+    assert isinstance(norm_scaler, Normalizer)
+
+    # 2. Test extended imputers
+    iter_imp = get_numeric_imputer("iterative")
+    assert isinstance(iter_imp, IterativeImputer)
+    iter_imp2 = create_imputer("numeric", "iterative")
+    assert isinstance(iter_imp2, IterativeImputer)
+
+    # 3. Test extended models in model factory
+    ada = create_base_estimator("AdaBoostClassifier", "binary_classification")
+    assert isinstance(ada, AdaBoostClassifier)
+    mlp = create_base_estimator("MLPClassifier", "binary_classification")
+    assert isinstance(mlp, MLPClassifier)
+    gnb = create_base_estimator("GaussianNB", "binary_classification")
+    assert isinstance(gnb, GaussianNB)
+    elastic = create_base_estimator("ElasticNet", "regression")
+    assert elastic is not None
+    huber = create_base_estimator("HuberRegressor", "regression")
+    assert huber is not None
+
+    # 4. Test search plans for new models
+    ada_plan = get_search_plan_for_model("AdaBoostClassifier", "binary_classification")
+    assert "learning_rate" in ada_plan.coarse_space
+    mlp_plan = get_search_plan_for_model("MLPClassifier", "binary_classification")
+    assert "learning_rate_init" in mlp_plan.coarse_space
+
+    # 5. Test fitting full pipeline with new preprocessing options
+    df, _ = synthetic_classification_df
+    X = df[["age", "income", "credit_score", "category"]]
+    y = df["target"]
+    custom_strategy = PreprocessingStrategy(
+        numeric_imputer="iterative",
+        numeric_scaler="power",
+        categorical_imputer="most_frequent",
+        categorical_encoder="one_hot"
+    )
+    pipe = build_full_model_pipeline(
+        model_estimator=ada,
+        numeric_features=["age", "income", "credit_score"],
+        categorical_features=["category"],
+        strategy=custom_strategy
+    )
+    pipe.fit(X, y)
+    preds = pipe.predict(X)
+    assert len(preds) == len(y)
+
+
+

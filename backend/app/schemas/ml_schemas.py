@@ -33,8 +33,8 @@ class FeatureSelectionResult(BaseModel):
 
 
 class PreprocessingStrategy(BaseModel):
-    numeric_imputer: str = Field(default="median", description="'median', 'mean', 'most_frequent', or 'knn'")
-    numeric_scaler: Optional[str] = Field(default="robust", description="'robust', 'standard', 'minmax', 'quantile', or null")
+    numeric_imputer: str = Field(default="median", description="'median', 'mean', 'most_frequent', 'knn', or 'iterative'")
+    numeric_scaler: Optional[str] = Field(default="robust", description="'robust', 'standard', 'minmax', 'maxabs', 'quantile', 'power', 'normalizer', or null")
     categorical_imputer: str = Field(default="most_frequent", description="'most_frequent' or 'constant'")
     categorical_encoder: str = Field(default="one_hot", description="'one_hot', 'ordinal', or 'target'")
     handle_unknown: str = Field(default="ignore", description="Strategy for unknown categories at inference")
@@ -42,8 +42,8 @@ class PreprocessingStrategy(BaseModel):
 
 
 class ModelCandidate(BaseModel):
-    model_name: str = Field(description="Identifier e.g. 'RandomForest', 'LogisticRegression', 'LightGBM', 'SVC', 'GradientBoosting', 'MLP'")
-    model_family: str = Field(description="'linear', 'tree_ensemble', 'gradient_boosting', 'support_vector', 'neighbors', or 'neural_network'")
+    model_name: str = Field(description="Identifier e.g. 'RandomForest', 'ExtraTrees', 'LogisticRegression', 'LightGBM', 'CatBoost', 'XGBoost', 'SVC', 'AdaBoost', 'MLP', 'GaussianNB', 'Ridge', 'ElasticNet', 'HuberRegressor'")
+    model_family: str = Field(description="'linear', 'tree_ensemble', 'gradient_boosting', 'support_vector', 'neighbors', 'neural_network', or 'naive_bayes'")
     reason: str = Field(description="Detailed reason for selecting this candidate based on dataset characteristics")
     preprocessing_strategy: PreprocessingStrategy = Field(description="Tailored preprocessing configuration specific to this model")
 

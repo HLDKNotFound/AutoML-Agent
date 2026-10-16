@@ -30,9 +30,11 @@ from backend.app.agents.ml_strategy_agent import run_ml_strategy_agent
 from backend.app.agents.hyperparameter_agent import get_search_plan_for_model
 from backend.app.agents.report_agent import run_report_agent
 from backend.app.optimization.optimizer import optimize_candidate_model
-from backend.app.evaluation.evaluator import evaluate_pipeline
+from backend.app.evaluation.evaluator import evaluate_pipeline, evaluate_dummy_baseline
+from backend.app.evaluation.metric_registry import is_metric_better, get_optimization_score
 from backend.app.services.artifact_manager import save_model_artifact
 from backend.app.preprocessing.feature_engineer import TabularFeatureEngineer
+from backend.app.preprocessing.splitter import split_dataset_robustly, SplitConfig
 from backend.app.models.ensemble import EnsembleBlendPipeline
 
 # In-memory DataFrame cache and session pipeline store
@@ -95,6 +97,8 @@ class MLWorkflowState(TypedDict):
     artifacts: Dict[str, Any]
     errors: List[str]
     agent_decisions: List[Dict[str, Any]]
+    split_metadata: Optional[Dict[str, Any]]
+    gemini_api_key: Optional[str]
     status: str
 
 
@@ -145,7 +149,8 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
         profile = compute_dataset_profile(
             df=df,
             target_column=state["target_column"],
-            feature_columns=state["selected_features"]
+            feature_columns=state["selected_features"],
+            user_problem_type=state.get("problem_type")
         )
 
         # Generate exploratory visualizations
@@ -243,44 +248,39 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
     def split_dataset(state: MLWorkflowState) -> Dict[str, Any]:
         emit(4, "Dataset Splitting", "running", "Splitting dataset strictly into 70% Train, 15% Validation, 15% Test...")
         df = get_cached_dataframe(state["dataset_path"])
-        target_col = state["target_column"]
-        y = df[target_col]
-        indices = np.arange(len(df))
+        p_type = state.get("problem_type") or state["dataframe_summary"].get("suggested_problem_type", "classification")
 
-        stratify = None
-        # Stratify if classification with sufficient counts
-        if state["dataframe_summary"].get("target_stats", {}).get("type") in ("binary_classification", "multiclass_classification"):
-            class_counts = y.value_counts()
-            if (class_counts >= 2).all():
-                stratify = y
-
-        # 70% Train, 30% Temp (Val + Test)
-        train_idx, temp_idx = train_test_split(
-            indices,
-            test_size=0.30,
-            random_state=config.random_state,
-            stratify=stratify
+        split_cfg = SplitConfig(
+            train_ratio=config.train_ratio,
+            val_ratio=config.validation_ratio,
+            test_ratio=config.test_ratio,
+            random_state=config.random_state
         )
 
-        stratify_temp = None
-        if stratify is not None:
-            stratify_temp = y.iloc[temp_idx]
+        try:
+            train_list, val_list, test_list, split_meta = split_dataset_robustly(
+                df=df,
+                target_column=state["target_column"],
+                problem_type=p_type,
+                config=split_cfg
+            )
+        except Exception as e:
+            err = f"Dataset splitting failed: {e}"
+            emit(4, "Dataset Splitting", "failed", err)
+            return {"errors": [err], "status": "failed"}
 
-        # 15% Validation, 15% Test
-        val_idx, test_idx = train_test_split(
-            temp_idx,
-            test_size=0.50,
-            random_state=config.random_state,
-            stratify=stratify_temp
-        )
+        # Emit warnings if rare classes caused fallback
+        for w in split_meta.get("warnings", []):
+            emit(4, "Dataset Splitting", "running", f"Split Notice: {w}")
 
         emit(4, "Dataset Splitting", "completed", 
-             f"Dataset partitioned: {len(train_idx)} Train (70%), {len(val_idx)} Validation (15%), {len(test_idx)} Test (15%).")
+             f"Dataset partitioned ({split_meta.get('policy_used')}): {len(train_list)} Train, {len(val_list)} Validation, {len(test_list)} Test.")
 
         return {
-            "train_indices": train_idx.tolist(),
-            "val_indices": val_idx.tolist(),
-            "test_indices": test_idx.tolist()
+            "train_indices": train_list,
+            "val_indices": val_list,
+            "test_indices": test_list,
+            "split_metadata": split_meta
         }
 
     # Node 6: feature_selection_agent
@@ -425,6 +425,32 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
         fitted_pipelines = {}
         optimization_results = {}
 
+        # 1. Anchor with heuristic Dummy Baseline
+        try:
+            baseline_res = evaluate_dummy_baseline(
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                problem_type=state["problem_type"]
+            )
+            model_results.append({
+                "model_name": baseline_res["model_name"],
+                "model_family": baseline_res["model_family"],
+                "metrics": baseline_res["metrics"],
+                "train_time_sec": baseline_res["train_time_sec"],
+                "inference_time_ms": baseline_res["inference_time_ms"],
+                "model_size_kb": baseline_res["model_size_kb"],
+                "best_hyperparameters": baseline_res["best_hyperparameters"],
+                "preprocessing_summary": baseline_res["preprocessing_summary"],
+                "status": "completed"
+            })
+            emit(9, "Hyperparameter Optimization", "running",
+                 f"Baseline anchor established: {baseline_res['model_name']} validation {state['primary_metric'].upper()}={baseline_res['metrics'].get(state['primary_metric'], 0.0):.4f}.")
+        except Exception as e:
+            pass
+
+        # 2. Optimize candidate portfolio
         for idx, model_cand in enumerate(cand_models):
             m_name = model_cand["model_name"]
             m_fam = model_cand["model_family"]
@@ -463,10 +489,25 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
                 feature_engineer=fe
             )
 
+            if res.get("status") == "failed" or res.get("best_pipeline") is None:
+                eval_entry = {
+                    "model_name": m_name,
+                    "model_family": m_fam,
+                    "metrics": {},
+                    "train_time_sec": res.get("train_time_sec", 0.0),
+                    "inference_time_ms": 0.0,
+                    "model_size_kb": 0.0,
+                    "best_hyperparameters": {},
+                    "preprocessing_summary": model_cand["preprocessing_strategy"],
+                    "status": "failed",
+                    "error": res.get("error", "Optimization failed")
+                }
+                model_results.append(eval_entry)
+                continue
+
             fitted_pipelines[m_name] = res["best_pipeline"]
             optimization_results[m_name] = res.get("optimization_history", [])
 
-            # Save clean serializable evaluation result
             eval_entry = {
                 "model_name": m_name,
                 "model_family": m_fam,
@@ -480,14 +521,18 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             }
             model_results.append(eval_entry)
 
-        # Construct and evaluate Top Models Ensemble Blend
-        if len(model_results) >= 2:
-            p_metric = state["primary_metric"]
-            is_error_metric = p_metric in ("rmse", "mse", "mae", "mape", "log_loss")
+        # 3. Construct and evaluate Top Models Ensemble Blend
+        p_metric = state["primary_metric"]
+        successful_candidates = [
+            m for m in model_results 
+            if m.get("status") == "completed" and m["model_family"] != "baseline" and m["model_name"] in fitted_pipelines
+        ]
+
+        if len(successful_candidates) >= 2:
             sorted_models = sorted(
-                model_results,
-                key=lambda r: r["metrics"].get(p_metric, float("inf") if is_error_metric else -float("inf")),
-                reverse=not is_error_metric
+                successful_candidates,
+                key=lambda r: get_optimization_score(p_metric, r["metrics"].get(p_metric, -1e9)),
+                reverse=True
             )
             top_k = min(3, len(sorted_models))
             top_models = sorted_models[:top_k]
@@ -533,7 +578,7 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
         _SESSION_PIPELINES[state["session_id"]] = fitted_pipelines
 
         emit(9, "Hyperparameter Optimization", "completed", 
-             f"Hyperparameter optimization completed for all {total_models} candidate models plus Ensemble Blend.")
+             f"Hyperparameter optimization completed for {len(model_results)} evaluated models.")
 
         return {
             "model_results": model_results,
@@ -556,20 +601,31 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
     def select_best_model_node(state: MLWorkflowState) -> Dict[str, Any]:
         emit(10, "Select Best Model", "running", "Selecting highest-performing pipeline strictly on validation metrics...")
         p_metric = state["primary_metric"]
-        p_type = state["problem_type"]
         results = state["model_results"]
 
-        # Sort strictly on validation metric
-        is_error_metric = p_metric in ("rmse", "mse", "mae", "mape", "log_loss")
-        best = min(results, key=lambda r: r["metrics"].get(p_metric, float("inf"))) if is_error_metric \
-            else max(results, key=lambda r: r["metrics"].get(p_metric, -float("inf")))
+        # Filter completed non-failing models with valid metrics
+        completed_candidates = [
+            r for r in results 
+            if r.get("status") == "completed" and r.get("metrics") and p_metric in r["metrics"]
+        ]
+
+        if not completed_candidates:
+            err = f"All candidate models failed during training and optimization. No valid model could be selected."
+            emit(10, "Select Best Model", "failed", err)
+            return {"errors": [err], "status": "failed"}
+
+        # Select best strictly using canonical metric direction score
+        best = max(
+            completed_candidates,
+            key=lambda r: get_optimization_score(p_metric, r["metrics"].get(p_metric, -1e9))
+        )
 
         decisions = list(state.get("agent_decisions", []))
         decisions.append({
             "agent": "ModelSelectionAgent",
             "decision": f"Selected Champion: {best['model_name']}",
             "reason": f"Achieved superior validation {p_metric.upper()} of {best['metrics'].get(p_metric, 0.0):.4f} with inference latency of {best['inference_time_ms']:.2f} ms.",
-            "input_statistics": f"{len(results)} evaluated models: {[r['model_name'] for r in results]}",
+            "input_statistics": f"{len(completed_candidates)} validly evaluated models: {[r['model_name'] for r in completed_candidates]}",
             "output_configuration": f"Best parameters: {best['best_hyperparameters']}"
         })
 
@@ -638,7 +694,9 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             validation_metrics=state["best_model"]["metrics"],
             test_metrics=state["test_results"],
             plots=state["plots"],
-            primary_metric=state["primary_metric"]
+            primary_metric=state["primary_metric"],
+            test_sample_size=len(state.get("test_indices", [])),
+            api_key=state.get("gemini_api_key")
         )
 
         # Save model artifact bundle
@@ -662,7 +720,9 @@ def create_ml_workflow(event_emitter: Optional[Callable[[Dict[str, Any]], None]]
             best_params=state["best_model"]["best_hyperparameters"],
             validation_metrics=state["best_model"]["metrics"],
             test_metrics=state["test_results"],
-            training_report=training_report_payload
+            training_report=training_report_payload,
+            split_config=state.get("split_metadata"),
+            primary_metric=state["primary_metric"]
         )
 
         emit(12, "Model Artifact", "completed", 

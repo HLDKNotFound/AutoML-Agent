@@ -1,21 +1,22 @@
 """
 FastAPI Route Endpoints.
-Handles file uploads, session state management, pipeline execution,
+Handles file uploads with chunked size limits, session isolation, path traversal protection,
 real-time SSE event streaming, artifact downloads, and batch predictions.
 """
 
 import io
 import os
+import re
 import uuid
 import json
 import time
 import asyncio
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 import pandas as pd
 from fastapi import APIRouter, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.app.core.config import config, DATA_DIR, ARTIFACTS_DIR
 from backend.app.services.profiler import compute_dataset_profile
@@ -24,8 +25,12 @@ from backend.app.services.inference import run_batch_inference
 
 router = APIRouter(prefix="/api")
 
-# Max upload limit (50 MB)
-MAX_UPLOAD_SIZE_BYTES = 50 * 1024 * 1024
+# Security limits
+MAX_UPLOAD_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_DATASET_ROWS = 500000
+MAX_DATASET_COLS = 500
+MAX_DATASET_CELLS = 10000000
+ALLOWED_SAMPLE_DATASETS = {"churn.csv", "housing.csv", "wine.csv"}
 
 # In-memory session store, event queues, and event history buffer
 SESSIONS: Dict[str, Dict[str, Any]] = {}
@@ -33,17 +38,62 @@ EVENT_QUEUES: Dict[str, List[asyncio.Queue]] = {}
 EVENT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
 
 
+def validate_session_id(session_id: str) -> str:
+    """Validates session_id against path traversal and strict alphanumeric format."""
+    if not session_id or not isinstance(session_id, str):
+        raise HTTPException(status_code=400, detail="Invalid session identifier.")
+    clean_id = session_id.strip()
+    if not re.match(r"^[a-zA-Z0-9_\-]+$", clean_id):
+        raise HTTPException(status_code=400, detail="Session identifier contains illegal characters.")
+    
+    # Path traversal validation
+    data_target = (DATA_DIR / f"{clean_id}.csv").resolve()
+    if not str(data_target).startswith(str(DATA_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Path traversal detected in session identifier.")
+    return clean_id
+
+
+async def _read_upload_with_limit(file: UploadFile, max_bytes: int = MAX_UPLOAD_SIZE_BYTES) -> bytes:
+    """
+    Streams file upload in 64KB chunks to enforce upload size limits
+    without loading oversized files entirely into memory.
+    """
+    chunks = []
+    total_bytes = 0
+    chunk_size = 64 * 1024
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Uploaded file exceeds maximum allowed size of {max_bytes // (1024 * 1024)}MB."
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def cleanup_expired_sessions(max_age_seconds: int = 86400) -> int:
-    """Removes sessions older than max_age_seconds to prevent memory leaks."""
+    """Removes sessions older than max_age_seconds to prevent memory and disk leaks."""
     now = time.time()
     expired = [
-        sid for sid, s in SESSIONS.items()
+        sid for sid, s in list(SESSIONS.items())
         if now - s.get("created_at", now) > max_age_seconds
     ]
     for sid in expired:
-        SESSIONS.pop(sid, None)
+        session = SESSIONS.pop(sid, None)
         EVENT_QUEUES.pop(sid, None)
         EVENT_HISTORY.pop(sid, None)
+        # Clean up temporary dataset file if it exists
+        if session and session.get("dataset_path"):
+            try:
+                p = Path(session["dataset_path"])
+                if p.exists() and p.resolve().parent == DATA_DIR.resolve():
+                    p.unlink()
+            except Exception:
+                pass
     return len(expired)
 
 
@@ -51,7 +101,8 @@ class StartPipelineRequest(BaseModel):
     session_id: str
     target_column: str
     selected_features: Optional[List[str]] = None
-    gemini_api_key: Optional[str] = None
+    problem_type: Optional[str] = Field(default=None, description="Explicit task type: 'classification', 'regression', 'binary_classification', or 'multiclass_classification'")
+    gemini_api_key: Optional[str] = Field(default=None, description="Per-session API key for BYOK without global mutation")
 
 
 class SampleLoadRequest(BaseModel):
@@ -120,11 +171,16 @@ async def get_sample_datasets():
 async def load_sample(req: SampleLoadRequest):
     """Loads a pre-packaged sample CSV into a new pipeline session."""
     cleanup_expired_sessions()
-    sample_file = DATA_DIR / req.sample_name
-    if not sample_file.exists():
-        raise HTTPException(status_code=404, detail=f"Sample dataset '{req.sample_name}' not found.")
+    
+    clean_sample_name = Path(req.sample_name).name
+    if clean_sample_name not in ALLOWED_SAMPLE_DATASETS:
+        raise HTTPException(status_code=404, detail=f"Sample dataset '{req.sample_name}' is not supported.")
 
-    session_id = f"sample_{req.sample_name.replace('.csv', '')}_{uuid.uuid4().hex[:8]}"
+    sample_file = (DATA_DIR / clean_sample_name).resolve()
+    if not sample_file.exists() or not str(sample_file).startswith(str(DATA_DIR.resolve())):
+        raise HTTPException(status_code=404, detail=f"Sample dataset '{clean_sample_name}' not found on disk.")
+
+    session_id = f"sample_{clean_sample_name.replace('.csv', '')}_{uuid.uuid4().hex[:8]}"
     dest_path = DATA_DIR / f"{session_id}.csv"
     
     df = pd.read_csv(sample_file)
@@ -135,7 +191,7 @@ async def load_sample(req: SampleLoadRequest):
     SESSIONS[session_id] = {
         "session_id": session_id,
         "dataset_path": str(dest_path),
-        "filename": req.sample_name,
+        "filename": clean_sample_name,
         "summary": summary,
         "status": "ready",
         "created_at": now,
@@ -147,28 +203,38 @@ async def load_sample(req: SampleLoadRequest):
 
 @router.post("/upload")
 async def upload_dataset(file: UploadFile = File(...)):
-    """Receives user CSV upload, validates format, and prepares session."""
+    """Receives user CSV upload, validates format and limits, and prepares session."""
     cleanup_expired_sessions()
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files (.csv) are supported.")
 
     session_id = f"sess_{uuid.uuid4().hex[:12]}"
     file_path = DATA_DIR / f"{session_id}.csv"
 
-    contents = await file.read()
-    if len(contents) > MAX_UPLOAD_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Uploaded file exceeds maximum allowed size of {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB."
-        )
+    contents = await _read_upload_with_limit(file, MAX_UPLOAD_SIZE_BYTES)
 
+    # Validate textual content
     try:
         df = pd.read_csv(io.BytesIO(contents))
+    except UnicodeDecodeError:
+        try:
+            df = pd.read_csv(io.BytesIO(contents), encoding="latin1")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse CSV file: encoding error ({e})")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse CSV file: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to parse CSV file: {str(e)[:200]}")
 
     if df.empty or len(df.columns) < 2:
         raise HTTPException(status_code=400, detail="Dataset must contain at least 2 columns and at least 1 row.")
+
+    if len(df) > MAX_DATASET_ROWS:
+        raise HTTPException(status_code=400, detail=f"Dataset exceeds maximum allowed rows ({MAX_DATASET_ROWS:,}).")
+
+    if len(df.columns) > MAX_DATASET_COLS:
+        raise HTTPException(status_code=400, detail=f"Dataset exceeds maximum allowed columns ({MAX_DATASET_COLS}).")
+
+    if (len(df) * len(df.columns)) > MAX_DATASET_CELLS:
+        raise HTTPException(status_code=400, detail=f"Dataset cell count exceeds maximum threshold of {MAX_DATASET_CELLS:,}.")
 
     df.to_csv(file_path, index=False)
     summary = _summarize_dataframe(df)
@@ -177,7 +243,7 @@ async def upload_dataset(file: UploadFile = File(...)):
     SESSIONS[session_id] = {
         "session_id": session_id,
         "dataset_path": str(file_path),
-        "filename": file.filename,
+        "filename": Path(file.filename).name,
         "summary": summary,
         "status": "ready",
         "created_at": now,
@@ -189,7 +255,7 @@ async def upload_dataset(file: UploadFile = File(...)):
 
 @router.post("/configure-llm")
 async def configure_llm(req: LLMConfigRequest):
-    """Allows setting, updating, or clearing Gemini API key dynamically."""
+    """Allows setting, updating, or clearing default server-level Gemini API key."""
     api_key = req.gemini_api_key.strip()
     if not api_key:
         config.gemini_api_key = ""
@@ -215,7 +281,6 @@ def _run_workflow_background(session_id: str, state_input: Dict[str, Any], loop:
 
     def event_emitter(event: Dict[str, Any]):
         EVENT_HISTORY[session_id].append(event)
-        # Push event to all connected SSE clients thread-safely
         for q in list(EVENT_QUEUES.get(session_id, [])):
             try:
                 if loop and loop.is_running():
@@ -245,7 +310,7 @@ def _run_workflow_background(session_id: str, state_input: Dict[str, Any], loop:
             "timestamp": "Done"
         })
     except Exception as e:
-        err_msg = f"Workflow runtime error: {str(e)}"
+        err_msg = f"Workflow runtime error: {str(e)[:300]}"
         if session_id in SESSIONS:
             SESSIONS[session_id]["status"] = "failed"
             SESSIONS[session_id]["error"] = err_msg
@@ -261,16 +326,18 @@ def _run_workflow_background(session_id: str, state_input: Dict[str, Any], loop:
 
 @router.post("/start-pipeline")
 async def start_pipeline(req: StartPipelineRequest, background_tasks: BackgroundTasks):
-    """Initiates the end-to-end LangGraph ML workflow."""
-    session = SESSIONS.get(req.session_id)
+    """Initiates the end-to-end LangGraph ML workflow with session isolation."""
+    clean_id = validate_session_id(req.session_id)
+    session = SESSIONS.get(clean_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
 
+    # Session-isolated API key handling (avoid process-wide mutation)
+    session_key = None
     if req.gemini_api_key and req.gemini_api_key.strip():
         k = req.gemini_api_key.strip()
         if not (k.startswith("AQ.") or k.startswith("ya29.")):
-            config.gemini_api_key = k
-            os.environ["GEMINI_API_KEY"] = k
+            session_key = k
 
     df = pd.read_csv(session["dataset_path"])
     
@@ -288,11 +355,10 @@ async def start_pipeline(req: StartPipelineRequest, background_tasks: Background
     if len(df) < config.min_samples_threshold:
         raise HTTPException(status_code=400, detail=f"Dataset must have at least {config.min_samples_threshold} samples.")
 
-    # Initialize event queue list for SSE streaming
-    EVENT_QUEUES[req.session_id] = []
+    EVENT_QUEUES[clean_id] = []
 
     state_input = {
-        "session_id": req.session_id,
+        "session_id": clean_id,
         "dataset_path": session["dataset_path"],
         "dataframe_summary": {},
         "initial_features": features,
@@ -301,7 +367,7 @@ async def start_pipeline(req: StartPipelineRequest, background_tasks: Background
         "data_quality_report": {},
         "feature_selection": {},
         "data_quality_iteration": 0,
-        "problem_type": "",
+        "problem_type": req.problem_type or "",
         "primary_metric": "",
         "preprocessing_configs": {},
         "candidate_models": [],
@@ -318,21 +384,24 @@ async def start_pipeline(req: StartPipelineRequest, background_tasks: Background
         "artifacts": {},
         "errors": [],
         "agent_decisions": [],
+        "gemini_api_key": session_key,
         "status": "running"
     }
 
     session["status"] = "running"
     session["target_column"] = req.target_column
     session["selected_features"] = features
+    session["gemini_api_key"] = session_key
     session["updated_at"] = time.time()
 
     loop = asyncio.get_running_loop()
-    background_tasks.add_task(_run_workflow_background, req.session_id, state_input, loop)
+    background_tasks.add_task(_run_workflow_background, clean_id, state_input, loop)
 
     return {
         "status": "started",
-        "session_id": req.session_id,
+        "session_id": clean_id,
         "target_column": req.target_column,
+        "problem_type": req.problem_type or "auto",
         "feature_count": len(features)
     }
 
@@ -340,22 +409,21 @@ async def start_pipeline(req: StartPipelineRequest, background_tasks: Background
 @router.get("/stream/{session_id}")
 async def stream_workflow_events(session_id: str):
     """SSE endpoint streaming real-time pipeline events."""
-    if session_id not in SESSIONS:
+    clean_id = validate_session_id(session_id)
+    if clean_id not in SESSIONS:
         raise HTTPException(status_code=404, detail="Session not found.")
 
     queue: asyncio.Queue = asyncio.Queue()
-    if session_id not in EVENT_QUEUES:
-        EVENT_QUEUES[session_id] = []
-    EVENT_QUEUES[session_id].append(queue)
+    if clean_id not in EVENT_QUEUES:
+        EVENT_QUEUES[clean_id] = []
+    EVENT_QUEUES[clean_id].append(queue)
 
     async def event_generator():
         try:
-            # Replay any previous events immediately to client so early/late stages are never missed
-            for past_ev in list(EVENT_HISTORY.get(session_id, [])):
+            for past_ev in list(EVENT_HISTORY.get(clean_id, [])):
                 yield f"data: {json.dumps(past_ev)}\n\n"
 
             while True:
-                # Wait for next event with a timeout for heartbeat keep-alive
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=15.0)
                     yield f"data: {json.dumps(event)}\n\n"
@@ -367,11 +435,10 @@ async def stream_workflow_events(session_id: str):
                     if is_terminal:
                         break
                 except asyncio.TimeoutError:
-                    # Send heartbeat ping to keep connection open
                     yield f": heartbeat\n\n"
         finally:
-            if session_id in EVENT_QUEUES and queue in EVENT_QUEUES[session_id]:
-                EVENT_QUEUES[session_id].remove(queue)
+            if clean_id in EVENT_QUEUES and queue in EVENT_QUEUES[clean_id]:
+                EVENT_QUEUES[clean_id].remove(queue)
 
     return StreamingResponse(
         event_generator(),
@@ -387,13 +454,14 @@ async def stream_workflow_events(session_id: str):
 @router.get("/session/{session_id}")
 async def get_session_details(session_id: str):
     """Retrieves full snapshot of current session state, metrics, charts, and agent logs."""
-    session = SESSIONS.get(session_id)
+    clean_id = validate_session_id(session_id)
+    session = SESSIONS.get(clean_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
 
     workflow_state = session.get("workflow_state", {})
     return {
-        "session_id": session_id,
+        "session_id": clean_id,
         "filename": session.get("filename"),
         "status": session.get("status", "pending"),
         "summary": session.get("summary", {}),
@@ -418,13 +486,16 @@ async def get_session_details(session_id: str):
 @router.get("/models/{session_id}/download")
 async def download_model_artifact(session_id: str):
     """Downloads zipped package with model.joblib, metadata.json, feature_schema.json."""
-    zip_path = ARTIFACTS_DIR / f"{session_id}_model_artifact.zip"
+    clean_id = validate_session_id(session_id)
+    zip_path = (ARTIFACTS_DIR / f"{clean_id}_model_artifact.zip").resolve()
+    if not str(zip_path).startswith(str(ARTIFACTS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Path traversal detected.")
     if not zip_path.exists():
         raise HTTPException(status_code=404, detail="Model artifact archive not found or training incomplete.")
 
     return FileResponse(
         path=str(zip_path),
-        filename=f"ml_model_{session_id}.zip",
+        filename=f"ml_model_{clean_id}.zip",
         media_type="application/zip"
     )
 
@@ -432,28 +503,29 @@ async def download_model_artifact(session_id: str):
 @router.post("/predict/{session_id}")
 async def upload_and_predict(session_id: str, file: UploadFile = File(...)):
     """Receives unlabeled CSV and runs batch inference using fitted frozen pipeline."""
-    session = SESSIONS.get(session_id)
+    clean_id = validate_session_id(session_id)
+    session = SESSIONS.get(clean_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    contents = await file.read()
-    if len(contents) > MAX_UPLOAD_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Uploaded file exceeds maximum allowed size of {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB."
-        )
+    contents = await _read_upload_with_limit(file, MAX_UPLOAD_SIZE_BYTES)
 
     try:
         df_input = pd.read_csv(io.BytesIO(contents))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {str(e)[:150]}")
+
+    if df_input.empty:
+        raise HTTPException(status_code=400, detail="Uploaded prediction CSV is empty.")
 
     try:
-        pred_df, summary = run_batch_inference(session_id, df_input)
+        pred_df, summary = run_batch_inference(clean_id, df_input)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Inference error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Inference error: {str(e)[:250]}")
 
-    out_file = DATA_DIR / f"{session_id}_predictions.csv"
+    out_file = (DATA_DIR / f"{clean_id}_predictions.csv").resolve()
+    if not str(out_file).startswith(str(DATA_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid prediction output path.")
     pred_df.to_csv(out_file, index=False)
 
     preview = pred_df.head(15).to_dict(orient="records")
@@ -462,19 +534,22 @@ async def upload_and_predict(session_id: str, file: UploadFile = File(...)):
         "total_rows": len(pred_df),
         "preview": preview,
         "summary": summary,
-        "download_url": f"/api/predict/{session_id}/download"
+        "download_url": f"/api/predict/{clean_id}/download"
     }
 
 
 @router.get("/predict/{session_id}/download")
 async def download_predictions(session_id: str):
     """Downloads generated prediction CSV formatted as id,predict."""
-    pred_file = DATA_DIR / f"{session_id}_predictions.csv"
+    clean_id = validate_session_id(session_id)
+    pred_file = (DATA_DIR / f"{clean_id}_predictions.csv").resolve()
+    if not str(pred_file).startswith(str(DATA_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid prediction path.")
     if not pred_file.exists():
         raise HTTPException(status_code=404, detail="Prediction file not found.")
 
     return FileResponse(
         path=str(pred_file),
-        filename=f"predictions_{session_id}.csv",
+        filename=f"predictions_{clean_id}.csv",
         media_type="text/csv"
     )

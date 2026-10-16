@@ -63,12 +63,20 @@ def run_batch_inference(
     target_col = metadata.get("target_column") or "predict"
     p_type = metadata.get("problem_type")
 
-    # If regression, ensure valid non-negative values for positive metrics like prices
-    if p_type == "regression":
-        predictions = np.clip(predictions, a_min=0.0, a_max=None)
+    # Preserve estimator's raw predictions unless an explicit target constraint is configured in metadata
+    target_constraints = metadata.get("target_constraints")
+    if p_type == "regression" and isinstance(target_constraints, dict):
+        c_min = target_constraints.get("min")
+        c_max = target_constraints.get("max")
+        if c_min is not None or c_max is not None:
+            predictions = np.clip(
+                predictions,
+                a_min=float(c_min) if c_min is not None else None,
+                a_max=float(c_max) if c_max is not None else None
+            )
     elif p_type == "binary_classification":
         # Check if target values were boolean
-        if isinstance(predictions[0], (bool, np.bool_)):
+        if len(predictions) > 0 and isinstance(predictions[0], (bool, np.bool_)):
             predictions = [bool(p) for p in predictions]
 
     # 6. Build output DataFrame preserving original ID name and target column

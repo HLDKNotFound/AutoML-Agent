@@ -37,11 +37,29 @@ def run_ml_strategy_agent(
     1. Determine problem_type: 'binary_classification', 'multiclass_classification', or 'regression'.
     2. Select primary_metric: 'f1_macro', 'roc_auc', 'accuracy', 'rmse', 'r2', or 'mae'.
     3. Select EXACTLY 5 candidate models from AT LEAST 3 distinct model families:
-       Valid families: 'linear', 'tree_ensemble', 'gradient_boosting', 'support_vector', 'neighbors'.
-       IMPORTANT: For datasets with more than 1500 samples, NEVER select 'SVC' or 'SVR' (kernel SVM is O(N^3) and too slow). Instead use fast scalable models: 'HistGradientBoostingClassifier', 'ExtraTreesClassifier', 'RandomForestClassifier', 'GradientBoostingClassifier', 'LogisticRegression'.
-    4. For EACH model, define an independent model-specific preprocessing_strategy:
-       - Tree models: no scaling (numeric_scaler=null), median imputer, ordinal/one_hot encoder.
-       - Linear/SVM/KNN/MLP: robust/standard scaling, one_hot encoding, median imputer.
+       Valid families:
+       - 'gradient_boosting' (e.g., CatBoostClassifier/Regressor, LGBMClassifier/Regressor, GradientBoostingClassifier/Regressor, HistGradientBoostingClassifier/Regressor)
+       - 'tree_ensemble' (e.g., RandomForestClassifier/Regressor, ExtraTreesClassifier/Regressor, AdaBoostClassifier/Regressor)
+       - 'linear' (e.g., LogisticRegression, Ridge, ElasticNet, HuberRegressor, BayesianRidge, SGDClassifier/Regressor)
+       - 'support_vector' (e.g., SVC, SVR)
+       - 'neighbors' (e.g., KNeighborsClassifier, KNeighborsRegressor)
+       - 'neural_network' (e.g., MLPClassifier, MLPRegressor)
+       - 'naive_bayes' (e.g., GaussianNB - for classification)
+
+       IMPORTANT CONSTRAINTS:
+       - For datasets with more than 1500 samples, NEVER select 'SVC' or 'SVR' (kernel SVM is O(N^3) and too slow). Instead use fast scalable models like 'HistGradientBoostingClassifier', 'LGBMClassifier', 'ExtraTreesClassifier', 'RandomForestClassifier', 'LogisticRegression', or 'AdaBoostClassifier'.
+    
+    4. For EACH model, define an independent model-specific preprocessing_strategy from scikit-learn:
+       - numeric_imputer: 'median', 'mean', 'most_frequent', 'knn', or 'iterative' (MICE)
+       - numeric_scaler: 'robust', 'standard', 'minmax', 'maxabs', 'quantile', 'power' (Yeo-Johnson), 'normalizer', or null (passthrough)
+       - categorical_imputer: 'most_frequent' or 'constant'
+       - categorical_encoder: 'one_hot', 'ordinal', or 'target'
+       - Strategy guidelines:
+         * Tree models (RandomForest, ExtraTrees, LightGBM, CatBoost): no scaling (numeric_scaler=null), median or iterative imputer, ordinal/one_hot/target encoder.
+         * Linear/SGD/Huber/BayesianRidge models: robust or standard scaling (or power for skewed distributions), one_hot or target encoding.
+         * Neural Network (MLP) & Support Vector (SVM): standard or power scaling, one_hot encoding, median or iterative imputer.
+         * Distance-based (KNN): minmax or robust scaling.
+         * Naive Bayes: standard, minmax, or power scaling.
     """
 
     llm_strategy = invoke_structured_llm(
@@ -109,6 +127,14 @@ def run_ml_strategy_agent(
     boosting_preprocessing = PreprocessingStrategy(
         numeric_imputer="median",
         numeric_scaler=None,
+        categorical_imputer="most_frequent",
+        categorical_encoder="one_hot",
+        handle_unknown="ignore"
+    )
+
+    neural_net_preprocessing = PreprocessingStrategy(
+        numeric_imputer="median",
+        numeric_scaler="standard",
         categorical_imputer="most_frequent",
         categorical_encoder="one_hot",
         handle_unknown="ignore"

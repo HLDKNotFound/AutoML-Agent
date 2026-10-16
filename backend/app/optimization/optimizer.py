@@ -6,26 +6,22 @@ Evaluates strictly on validation data to select optimal hyperparameters.
 """
 
 import time
+import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import optuna
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from backend.app.models.model_factory import create_base_estimator
 from backend.app.preprocessing.pipeline_builder import build_full_model_pipeline
 from backend.app.evaluation.evaluator import evaluate_pipeline
+from backend.app.evaluation.metric_registry import get_optimization_score, is_metric_better
 from backend.app.schemas.ml_schemas import PreprocessingStrategy, HyperparameterSearchPlan
 from backend.app.core.config import config
 
-
-def _score_from_metrics(metrics: Dict[str, float], primary_metric: str, problem_type: str) -> float:
-    """Extracts scalar score to maximize. For error metrics like RMSE/MAE/LogLoss, inverts value."""
-    val = metrics.get(primary_metric, 0.0)
-    if primary_metric in ("rmse", "mse", "mae", "mape", "log_loss"):
-        # Minimize error -> higher negative value is better
-        return -float(val)
-    return float(val)
+logger = logging.getLogger(__name__)
 
 
 def run_coarse_search(
@@ -48,6 +44,7 @@ def run_coarse_search(
     """
     Stage 1: Coarse Broad Search.
     Explores broad distributions across log-uniform, uniform, and discrete bounds.
+    Distinguishes completed, failed, and pruned trials with explicit error tracking.
     """
     coarse_space = search_plan.coarse_space
     trials_history = []
@@ -56,7 +53,6 @@ def run_coarse_search(
     best_params = {}
     best_pipeline = None
 
-    # Use Optuna RandomSampler for coarse broad exploration
     sampler = optuna.samplers.RandomSampler(seed=config.random_state)
     study = optuna.create_study(direction="maximize", sampler=sampler)
 
@@ -75,40 +71,51 @@ def run_coarse_search(
             elif p_type == "categorical":
                 params[param_name] = trial.suggest_categorical(param_name, spec["choices"])
 
-        # Build pipeline and evaluate
-        estimator = create_base_estimator(model_name, problem_type, params)
-        pipeline = build_full_model_pipeline(
-            estimator,
-            numeric_features=numeric_features,
-            categorical_features=categorical_features,
-            strategy=preprocessing_strategy,
-            transform_target_log=transform_target_log,
-            feature_engineer=feature_engineer
-        )
+        status = "completed"
+        error_msg = None
+        fit_time = 0.0
+        score = -1e9
+        metric_val = 0.0
+        pipeline = None
 
         try:
+            estimator = create_base_estimator(model_name, problem_type, params)
+            pipeline = build_full_model_pipeline(
+                estimator,
+                numeric_features=numeric_features,
+                categorical_features=categorical_features,
+                strategy=preprocessing_strategy,
+                transform_target_log=transform_target_log,
+                feature_engineer=feature_engineer
+            )
+
             t0 = time.perf_counter()
             pipeline.fit(X_train, y_train)
             fit_time = time.perf_counter() - t0
 
             eval_res = evaluate_pipeline(pipeline, X_val, y_val, problem_type, train_time_sec=fit_time)
-            score = _score_from_metrics(eval_res["metrics"], primary_metric, problem_type)
+            metric_val = float(eval_res["metrics"].get(primary_metric, 0.0))
+            score = get_optimization_score(primary_metric, metric_val)
         except Exception as e:
-            return -999999.0
+            status = "failed"
+            error_msg = f"{type(e).__name__}: {str(e)[:180]}"
+            logger.debug("Coarse trial %d failed for %s: %s", trial.number, model_name, error_msg)
 
         trial_data = {
             "trial_number": trial.number,
             "stage": "coarse",
             "params": params,
-            "score": score,
-            "metric_value": eval_res["metrics"].get(primary_metric, 0.0),
-            "fit_time": fit_time
+            "status": status,
+            "score": score if status == "completed" else None,
+            "metric_value": metric_val if status == "completed" else None,
+            "fit_time": fit_time,
+            "error": error_msg
         }
         trials_history.append(trial_data)
 
-        if score > best_score:
+        if status == "completed" and score > best_score:
             best_score = score
-            best_metric_val = eval_res["metrics"].get(primary_metric, 0.0)
+            best_metric_val = metric_val
             best_params = dict(params)
             best_pipeline = pipeline
 
@@ -117,8 +124,9 @@ def run_coarse_search(
                 "stage": "coarse",
                 "trial": trial.number + 1,
                 "total": n_trials,
-                "current_score": eval_res["metrics"].get(primary_metric, 0.0),
-                "best_score": best_metric_val
+                "current_score": metric_val if status == "completed" else 0.0,
+                "best_score": best_metric_val,
+                "status": status
             })
 
         return score
@@ -155,6 +163,7 @@ def run_fine_search(
     """
     Stage 2: Fine Search via Bayesian Optimization (Optuna TPESampler).
     Explicitly refines the search space bounds around the Stage 1 winners.
+    Tracks trial states and avoids selecting failed trials.
     """
     fine_space = search_plan.fine_space
     trials_history = []
@@ -163,7 +172,6 @@ def run_fine_search(
     best_params = dict(coarse_best_params)
     best_pipeline = None
 
-    # Bayesian optimization sampler
     sampler = optuna.samplers.TPESampler(seed=config.random_state)
     study = optuna.create_study(direction="maximize", sampler=sampler)
 
@@ -189,7 +197,7 @@ def run_fine_search(
 
     def objective(trial: optuna.Trial):
         nonlocal best_score, best_metric_val, best_params, best_pipeline
-        params = dict(coarse_best_params)  # start from best coarse values
+        params = dict(coarse_best_params)
         
         for param_name, spec in fine_space.items():
             p_type = spec.get("type")
@@ -203,39 +211,51 @@ def run_fine_search(
             elif p_type == "categorical":
                 params[param_name] = trial.suggest_categorical(param_name, spec["choices"])
 
-        estimator = create_base_estimator(model_name, problem_type, params)
-        pipeline = build_full_model_pipeline(
-            estimator,
-            numeric_features=numeric_features,
-            categorical_features=categorical_features,
-            strategy=preprocessing_strategy,
-            transform_target_log=transform_target_log,
-            feature_engineer=feature_engineer
-        )
+        status = "completed"
+        error_msg = None
+        fit_time = 0.0
+        score = -1e9
+        metric_val = 0.0
+        pipeline = None
 
         try:
+            estimator = create_base_estimator(model_name, problem_type, params)
+            pipeline = build_full_model_pipeline(
+                estimator,
+                numeric_features=numeric_features,
+                categorical_features=categorical_features,
+                strategy=preprocessing_strategy,
+                transform_target_log=transform_target_log,
+                feature_engineer=feature_engineer
+            )
+
             t0 = time.perf_counter()
             pipeline.fit(X_train, y_train)
             fit_time = time.perf_counter() - t0
 
             eval_res = evaluate_pipeline(pipeline, X_val, y_val, problem_type, train_time_sec=fit_time)
-            score = _score_from_metrics(eval_res["metrics"], primary_metric, problem_type)
+            metric_val = float(eval_res["metrics"].get(primary_metric, 0.0))
+            score = get_optimization_score(primary_metric, metric_val)
         except Exception as e:
-            return -999999.0
+            status = "failed"
+            error_msg = f"{type(e).__name__}: {str(e)[:180]}"
+            logger.debug("Fine trial %d failed for %s: %s", trial.number, model_name, error_msg)
 
         trial_data = {
             "trial_number": trial.number,
             "stage": "fine",
             "params": params,
-            "score": score,
-            "metric_value": eval_res["metrics"].get(primary_metric, 0.0),
-            "fit_time": fit_time
+            "status": status,
+            "score": score if status == "completed" else None,
+            "metric_value": metric_val if status == "completed" else None,
+            "fit_time": fit_time,
+            "error": error_msg
         }
         trials_history.append(trial_data)
 
-        if score > best_score:
+        if status == "completed" and score > best_score:
             best_score = score
-            best_metric_val = eval_res["metrics"].get(primary_metric, 0.0)
+            best_metric_val = metric_val
             best_params = dict(params)
             best_pipeline = pipeline
 
@@ -244,8 +264,9 @@ def run_fine_search(
                 "stage": "fine",
                 "trial": trial.number + 1,
                 "total": n_trials,
-                "current_score": eval_res["metrics"].get(primary_metric, 0.0),
-                "best_score": best_metric_val
+                "current_score": metric_val if status == "completed" else 0.0,
+                "best_score": best_metric_val,
+                "status": status
             })
 
         return score
@@ -279,6 +300,7 @@ def optimize_candidate_model(
 ) -> Dict[str, Any]:
     """
     Executes end-to-end two-stage coarse-to-fine optimization for a single candidate model.
+    Handles all-trial-failure gracefully without crashing subsequent nodes.
     """
     t_start = time.perf_counter()
 
@@ -288,7 +310,7 @@ def optimize_candidate_model(
         try:
             from scipy.stats import skew
             clean_y = y_train.dropna()
-            if (clean_y > 0).all() and float(skew(clean_y)) > 0.75:
+            if len(clean_y) > 0 and (clean_y > 0).all() and float(skew(clean_y)) > 0.75:
                 transform_target_log = True
         except Exception:
             pass
@@ -335,7 +357,41 @@ def optimize_candidate_model(
     total_time = time.perf_counter() - t_start
 
     # Final validation evaluation of the optimized pipeline
-    best_pipeline = fine_res["best_pipeline"] or coarse_res["best_pipeline"]
+    best_pipeline = fine_res.get("best_pipeline") or coarse_res.get("best_pipeline")
+    best_params = fine_res.get("best_params") or coarse_res.get("best_params") or {}
+
+    # Graceful fallback: If every trial failed during hyperparameter search, fit un-tuned default
+    if best_pipeline is None:
+        try:
+            logger.warning("All hyperparameter trials failed for %s. Attempting default estimator fit.", model_name)
+            default_estimator = create_base_estimator(model_name, problem_type, {})
+            fallback_pipeline = build_full_model_pipeline(
+                default_estimator,
+                numeric_features=numeric_features,
+                categorical_features=categorical_features,
+                strategy=preprocessing_strategy,
+                transform_target_log=transform_target_log,
+                feature_engineer=feature_engineer
+            )
+            fallback_pipeline.fit(X_train, y_train)
+            best_pipeline = fallback_pipeline
+            best_params = {"fallback": "default_un-tuned"}
+        except Exception as e:
+            logger.error("Default fit fallback failed for %s: %s", model_name, e)
+            return {
+                "model_name": model_name,
+                "model_family": model_family,
+                "best_pipeline": None,
+                "best_params": {},
+                "validation_metrics": {},
+                "train_time_sec": total_time,
+                "inference_time_ms": 0.0,
+                "model_size_kb": 0.0,
+                "status": "failed",
+                "error": f"All trials and default fallback failed: {e}",
+                "optimization_history": coarse_res["trials_history"] + fine_res["trials_history"]
+            }
+
     final_val_eval = evaluate_pipeline(
         best_pipeline,
         X_val,
@@ -348,10 +404,11 @@ def optimize_candidate_model(
         "model_name": model_name,
         "model_family": model_family,
         "best_pipeline": best_pipeline,
-        "best_params": fine_res["best_params"],
+        "best_params": best_params,
         "validation_metrics": final_val_eval["metrics"],
         "train_time_sec": total_time,
         "inference_time_ms": final_val_eval["inference_time_ms"],
         "model_size_kb": final_val_eval["model_size_kb"],
+        "status": "completed",
         "optimization_history": coarse_res["trials_history"] + fine_res["trials_history"]
     }

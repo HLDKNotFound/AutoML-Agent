@@ -2,6 +2,7 @@
 LLM Client integration module.
 Initializes ChatGoogleGenerativeAI (Gemini 2.5 Flash) via LangChain.
 Provides structured output invocation with robust fallback for offline/test environments.
+Supports per-request/per-session BYOK (Bring Your Own Key) isolation without global state leakage.
 """
 
 import os
@@ -13,16 +14,17 @@ from backend.app.core.config import config
 logger = logging.getLogger(__name__)
 
 
-def get_llm():
+def get_llm(api_key: Optional[str] = None):
     """
     Returns ChatGoogleGenerativeAI instance if API key is configured and valid, else None.
+    Accepts optional session-specific api_key for multi-user isolation.
     """
-    api_key = (config.gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
-    if not api_key:
+    effective_key = (api_key or config.gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    if not effective_key:
         return None
 
     # Detect OAuth access tokens that cause 401 ACCESS_TOKEN_TYPE_UNSUPPORTED
-    if api_key.startswith("AQ.") or api_key.startswith("ya29."):
+    if effective_key.startswith("AQ.") or effective_key.startswith("ya29."):
         logger.warning(
             "Configured API key appears to be an OAuth access token rather than a Google AI Studio API key (starts with 'AIzaSy'). "
             "Running seamlessly with the built-in deterministic Senior Data Scientist heuristics engine."
@@ -33,7 +35,7 @@ def get_llm():
         from langchain_google_genai import ChatGoogleGenerativeAI
         llm = ChatGoogleGenerativeAI(
             model=config.llm_model,
-            google_api_key=api_key,
+            google_api_key=effective_key,
             temperature=config.llm_temperature,
             max_retries=1
         )
@@ -46,13 +48,15 @@ def get_llm():
 def invoke_structured_llm(
     prompt: str,
     output_schema: Type[BaseModel],
-    system_instruction: str = "You are a Senior Machine Learning Engineer and AI Data Scientist."
+    system_instruction: str = "You are a Senior Machine Learning Engineer and AI Data Scientist.",
+    api_key: Optional[str] = None
 ) -> Optional[BaseModel]:
     """
     Invokes Gemini 2.5 Flash with structured Pydantic schema enforcement.
     Returns parsed Pydantic object or None if LLM is unavailable or fails.
+    Isolates errors per invocation without mutating process-wide configuration.
     """
-    llm = get_llm()
+    llm = get_llm(api_key=api_key)
     if not llm:
         return None
 
@@ -74,9 +78,8 @@ def invoke_structured_llm(
             logger.warning(
                 "Gemini API authentication failed (401 UNAUTHENTICATED): "
                 "The key is invalid or is an OAuth access token instead of a Google AI Studio API key ('AIzaSy...'). "
-                "Disabling LLM and running seamlessly on built-in deterministic Senior ML heuristics."
+                "Falling back seamlessly to built-in deterministic heuristics."
             )
-            config.gemini_api_key = ""  # Disable to avoid repeated 401s on subsequent nodes
         else:
             logger.warning("LLM invocation error: %s. Falling back to built-in heuristics.", e)
         return None

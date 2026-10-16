@@ -8,11 +8,13 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - LLM_MODEL=gemini-2.5-flash
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - LLM_MODEL=${LLM_MODEL:-gemini-2.5-flash}
+      - CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
     volumes:
       - ./data:/app/data
       - ./backend/artifacts:/app/backend/artifacts
+    restart: unless-stopped
 
   frontend:
     build:
@@ -22,3 +24,4 @@ services:
       - "5173:5173"
     depends_on:
       - backend
+    restart: unless-stopped

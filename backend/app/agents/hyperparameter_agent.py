@@ -115,7 +115,7 @@ def get_search_plan_for_model(model_name: str, problem_type: str) -> Hyperparame
         notes = "ExtraTrees randomized ensemble: tree complexity and split depth tuning."
 
     # 6. K-Nearest Neighbors
-    elif "kneighbors" in name:
+    elif "kneighbors" in name or "knn" in name:
         coarse_space = {
             "n_neighbors": {"type": "int", "low": 2, "high": 30},
             "weights": {"type": "categorical", "choices": ["uniform", "distance"]},
@@ -126,6 +126,96 @@ def get_search_plan_for_model(model_name: str, problem_type: str) -> Hyperparame
             "weights": {"type": "categorical", "choices": ["uniform", "distance"]}
         }
         notes = "Instance-based search: neighbor cardinality and distance weighting."
+
+    # 7. AdaBoost
+    elif "adaboost" in name:
+        coarse_space = {
+            "n_estimators": {"type": "int", "low": 30, "high": 200, "step": 20},
+            "learning_rate": {"type": "log_float", "low": 0.01, "high": 1.0}
+        }
+        fine_space = {
+            "n_estimators": {"type": "int", "low": 50, "high": 180, "step": 15},
+            "learning_rate": {"type": "log_float", "low": 0.05, "high": 0.8}
+        }
+        notes = "AdaBoost adaptive boosting: estimator count and learning rate shrinkage."
+
+    # 8. Multi-Layer Perceptron (Neural Network)
+    elif "mlp" in name:
+        coarse_space = {
+            "alpha": {"type": "log_float", "low": 1e-5, "high": 1e-1},
+            "learning_rate_init": {"type": "log_float", "low": 1e-4, "high": 1e-2}
+        }
+        fine_space = {
+            "alpha": {"type": "log_float", "low": 1e-4, "high": 1e-2},
+            "learning_rate_init": {"type": "log_float", "low": 5e-4, "high": 5e-3}
+        }
+        notes = "MLP Neural Network: weight decay L2 penalty alpha and Adam learning rate."
+
+    # 9. Naive Bayes (GaussianNB)
+    elif "gaussiannb" in name or "naivebayes" in name:
+        coarse_space = {
+            "var_smoothing": {"type": "log_float", "low": 1e-11, "high": 1e-2}
+        }
+        fine_space = {
+            "var_smoothing": {"type": "log_float", "low": 1e-10, "high": 1e-4}
+        }
+        notes = "GaussianNB: variance smoothing portion added to variances for calculation stability."
+
+    # 10. ElasticNet / Lasso
+    elif "elasticnet" in name:
+        coarse_space = {
+            "alpha": {"type": "log_float", "low": 1e-4, "high": 1e2},
+            "l1_ratio": {"type": "float", "low": 0.1, "high": 0.9}
+        }
+        fine_space = {
+            "alpha": {"type": "log_float", "low": 1e-3, "high": 10.0},
+            "l1_ratio": {"type": "float", "low": 0.2, "high": 0.8}
+        }
+        notes = "ElasticNet: regularizer penalty alpha and mixing parameter l1_ratio."
+
+    elif "lasso" in name:
+        coarse_space = {
+            "alpha": {"type": "log_float", "low": 1e-4, "high": 1e2}
+        }
+        fine_space = {
+            "alpha": {"type": "log_float", "low": 1e-3, "high": 10.0}
+        }
+        notes = "Lasso L1 regularizer penalty alpha."
+
+    # 11. Huber Regressor
+    elif "huber" in name:
+        coarse_space = {
+            "epsilon": {"type": "float", "low": 1.1, "high": 2.0},
+            "alpha": {"type": "log_float", "low": 1e-5, "high": 1e1}
+        }
+        fine_space = {
+            "epsilon": {"type": "float", "low": 1.2, "high": 1.8},
+            "alpha": {"type": "log_float", "low": 1e-4, "high": 1.0}
+        }
+        notes = "HuberRegressor: outlier threshold epsilon and L2 regularization alpha."
+
+    # 12. Bayesian Ridge
+    elif "bayesianridge" in name:
+        coarse_space = {
+            "alpha_1": {"type": "log_float", "low": 1e-8, "high": 1e-2},
+            "lambda_1": {"type": "log_float", "low": 1e-8, "high": 1e-2}
+        }
+        fine_space = {
+            "alpha_1": {"type": "log_float", "low": 1e-7, "high": 1e-4},
+            "lambda_1": {"type": "log_float", "low": 1e-7, "high": 1e-4}
+        }
+        notes = "BayesianRidge: shape parameters for Gamma prior over alpha and lambda."
+
+    # 13. Stochastic Gradient Descent (SGD)
+    elif "sgd" in name:
+        coarse_space = {
+            "alpha": {"type": "log_float", "low": 1e-5, "high": 1e-1},
+            "penalty": {"type": "categorical", "choices": ["l2", "l1", "elasticnet"]}
+        }
+        fine_space = {
+            "alpha": {"type": "log_float", "low": 1e-4, "high": 1e-2}
+        }
+        notes = "SGD linear estimator: regularization strength alpha and penalty term."
 
     # Default fallback
     else:
